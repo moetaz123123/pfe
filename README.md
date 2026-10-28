@@ -37,6 +37,10 @@ Les prérequis, variables et commandes de déploiement peuvent différer entre l
 deux projets. Vérifiez les fichiers d'exemple et la documentation avant toute
 exécution.
 
+## Vidéo de démonstration
+
+[▶ Regarder la vidéo de démonstration](https://drive.google.com/file/d/18MLPIV_flFM2lzdC9NJ5y6A8J2IfIwfO/view?usp=drive_link)
+
 ## Sécurité
 
 Ne publiez jamais de clés privées, mots de passe, fichiers de mots de passe
