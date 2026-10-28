@@ -1,0 +1,187 @@
+---
+# ============================================================
+# CALICO CNI — Installation et attente complète
+# podSubnet DOIT correspondre à kubeadm-config.yml : 192.168.0.0/16
+# ============================================================
+
+- name: Wait for API server to be reachable before CNI setup
+  uri:
+    url: "https://127.0.0.1:6443/readyz"
+    validate_certs: no
+    status_code: 200
+  register: api_ready
+  until: api_ready.status == 200
+  retries: 20
+  delay: 10
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Download Calico manifest
+  get_url:
+    url: "https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml"
+    dest: /tmp/calico.yaml
+    mode: "0644"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# ============================================================
+# PATCH podCIDR dans le manifest Calico
+# Obligatoire si podSubnet != 192.168.0.0/16 par défaut Calico
+# Ici on force la valeur pour matcher kubeadm-config.yml
+# ============================================================
+
+- name: Patch Calico manifest with correct pod CIDR
+  replace:
+    path: /tmp/calico.yaml
+    regexp: '192\.168\.0\.0\/16'
+    replace: "{{ pod_cidr | default('192.168.0.0/16') }}"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Apply Calico CNI
+  command: kubectl apply -f /tmp/calico.yaml
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: calico_apply
+  retries: 3
+  delay: 10
+  until: calico_apply.rc == 0
+
+# ============================================================
+# ATTENTE DaemonSet
+# ============================================================
+
+- name: Wait for Calico DaemonSet to be created
+  shell: kubectl get daemonset calico-node -n kube-system --no-headers
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: ds_check
+  retries: 30
+  delay: 10
+  until: ds_check.rc == 0
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# ============================================================
+# ATTENTE pods Calico — existence puis état Running
+# ============================================================
+
+- name: Wait for Calico pods to exist
+  shell: |
+    kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers 2>/dev/null | wc -l
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: calico_count
+  retries: 40
+  delay: 10
+  until: calico_count.stdout | trim | int > 0
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Wait for Calico pods to leave Pending state
+  shell: |
+    kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers 2>/dev/null \
+    | grep -v "Pending" | wc -l
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: calico_not_pending
+  retries: 30
+  delay: 15
+  until: calico_not_pending.stdout | trim | int > 0
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Wait for ALL Calico node pods to be Ready
+  shell: |
+    NOT_READY=$(kubectl get pods -n kube-system -l k8s-app=calico-node \
+      -o jsonpath='{.items[*].status.containerStatuses[*].ready}' \
+      | tr ' ' '\n' | grep -c "false" || true)
+    TOTAL=$(kubectl get pods -n kube-system -l k8s-app=calico-node \
+      --no-headers | wc -l)
+    [ "$TOTAL" -gt 0 ] && [ "$NOT_READY" -eq 0 ]
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: calico_ready
+  retries: 60
+  delay: 15
+  until: calico_ready.rc == 0
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# ============================================================
+# CALICO CONTROLLERS
+# ============================================================
+
+- name: Wait for Calico kube-controllers deployment
+  command: >
+    kubectl wait --for=condition=Available
+    deployment/calico-kube-controllers
+    -n kube-system
+    --timeout=300s
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# ============================================================
+# MASTER NODE READY — fix du grep faux positif
+# "grep -v NotReady" matche aussi la ligne "Ready" (header ou status)
+# On vérifie explicitement que le master est en état Ready
+# ============================================================
+
+- name: Wait for master node to become Ready
+  shell: |
+    STATUS=$(kubectl get node {{ groups['master'][0] }} \
+      --no-headers -o custom-columns=STATUS:.status.conditions[-1].type,REASON:.status.conditions[-1].status \
+      2>/dev/null)
+    echo "$STATUS"
+    echo "$STATUS" | grep -q "Ready.*True"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: master_ready
+  retries: 40
+  delay: 10
+  until: master_ready.rc == 0
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Show master node status
+  debug:
+    msg: "{{ master_ready.stdout_lines }}"
+  run_once: true
+
+# ============================================================
+# TOUS LES NODES READY (workers inclus si déjà joints)
+# ============================================================
+
+- name: Wait for all nodes to be Ready
+  shell: |
+    NOT_READY=$(kubectl get nodes --no-headers 2>/dev/null \
+      | awk '{print $2}' | grep -c "NotReady" || true)
+    TOTAL=$(kubectl get nodes --no-headers 2>/dev/null | wc -l)
+    echo "Total: $TOTAL | NotReady: $NOT_READY"
+    [ "$TOTAL" -gt 0 ] && [ "$NOT_READY" -eq 0 ]
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: all_nodes_ready
+  retries: 40
+  delay: 15
+  until: all_nodes_ready.rc == 0
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Show final cluster state
+  command: kubectl get nodes -o wide
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: final_state
+  changed_when: false
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Display cluster nodes
+  debug:
+    msg: "{{ final_state.stdout_lines }}"
+  run_once: true

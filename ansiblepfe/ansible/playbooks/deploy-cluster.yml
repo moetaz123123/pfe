@@ -1,0 +1,43 @@
+---
+- name: Phase 1 - Prepare all nodes
+  hosts: all
+  become: yes
+  vars_files:
+    - ../group_vars/all.yml
+  roles:
+    - common
+    - containerd
+    - kubernetes
+
+- name: Phase 2 - Initialize master
+  hosts: master
+  become: yes
+  vars_files:
+    - ../group_vars/all.yml
+  roles:
+    - master
+
+- name: Phase 3 - Join workers
+  hosts: workers
+  become: yes
+  vars_files:
+    - ../group_vars/all.yml
+  roles:
+    - worker
+
+- name: Phase 4 - Install CNI
+  hosts: master
+  become: yes
+  vars_files:
+    - ../group_vars/all.yml
+  roles:
+    - network
+
+- name: Phase 5 - Security hardening
+  hosts: all
+  become: yes
+  vars_files:
+    - ../group_vars/all.yml
+  roles:
+    - security
+

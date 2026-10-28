@@ -1,0 +1,837 @@
+---
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  Falco – Installation Helm conforme à la documentation officielle           ║
+# ║  https://falco.org/docs/setup/kubernetes/                                   ║
+# ║  Auto-détection CPU x86-64-v2 + driver eBPF selon kernel                   ║
+# ║  MODIF : Falcosidekick + UI (NodePort falcosidekick_ui_nodeport)            ║
+# ║  HA FIX : falcosidekick replicaCount=2 + podAntiAffinity                   ║
+# ║  HA FIX : falcosidekick-ui replicaCount=2 + podAntiAffinity                ║
+# ║  NFS FIX : Redis UI migré local-path → nfs                                 ║
+# ║  BUG FIX : Suppression StatefulSet Redis avant helm upgrade (spec immutable)║
+# ║  HA FIX v2 : tolerationSeconds=30 sur DaemonSet, Sidekick, UI, Redis       ║
+# ║  BUG FIX v3 : Attente pods Running avant lecture logs (PodInitializing fix) ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+# ── Helm Setup ────────────────────────────────────────────────────────────────
+- name: Install Helm (if missing)
+  shell: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  args:
+    creates: /usr/local/bin/helm
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  changed_when: false
+
+- name: Add Falco Helm repository
+  command: helm repo add falcosecurity https://falcosecurity.github.io/charts
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  changed_when: false
+
+- name: Update Helm repositories
+  command: helm repo update
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  changed_when: false
+
+# ── FIX : crictl endpoint sur TOUS les nœuds ─────────────────────────────────
+- name: Fix crictl endpoint config on all nodes
+  copy:
+    dest: /etc/crictl.yaml
+    content: |
+      runtime-endpoint: unix:///run/containerd/containerd.sock
+      image-endpoint: unix:///run/containerd/containerd.sock
+      timeout: 10
+      debug: false
+    mode: "0644"
+
+# ── Détection CPU x86-64-v2 sur TOUS les nœuds ───────────────────────────────
+- name: Check if CPU supports x86-64-v2 (SSE4.2 + POPCNT)
+  shell: |
+    flags=$(grep -m1 '^flags' /proc/cpuinfo)
+    if echo "$flags" | grep -q 'sse4_2' && echo "$flags" | grep -q 'popcnt'; then
+      echo "x86-64-v2-supported"
+    else
+      echo "x86-64-v1-only"
+    fi
+  register: cpu_v2_check
+  changed_when: false
+
+- name: Show CPU compatibility result per node
+  debug:
+    msg: "{{ inventory_hostname }} → {{ cpu_v2_check.stdout }}"
+
+# ── Détection driver Falco selon kernel ──────────────────────────────────────
+- name: Get kernel version on all nodes
+  shell: uname -r
+  register: kernel_version
+  changed_when: false
+
+- name: Show kernel version per node
+  debug:
+    msg: "{{ inventory_hostname }} → kernel {{ kernel_version.stdout }}"
+
+- name: Check BTF support (required for ebpf driver)
+  shell: |
+    if [ -f /sys/kernel/btf/vmlinux ]; then
+      echo "btf-supported"
+    else
+      echo "btf-missing"
+    fi
+  register: btf_check
+  changed_when: false
+
+- name: Show BTF support per node
+  debug:
+    msg: "{{ inventory_hostname }} → BTF: {{ btf_check.stdout }}"
+
+# ── Sélection automatique version Helm + driver ───────────────────────────────
+- name: Set Falco Helm chart version based on CPU support
+  set_fact:
+    falco_helm_chart_version: >-
+      {{
+        falco_helm_chart_version
+        if falco_helm_chart_version is defined
+        else (
+          '4.8.1'
+          if (ansible_play_hosts | map('extract', hostvars, ['cpu_v2_check', 'stdout']) | select('equalto', 'x86-64-v1-only') | list | length > 0)
+          else ''
+        )
+      }}
+  run_once: true
+  delegate_to: "{{ groups['master'][0] }}"
+
+- name: Set Falco driver kind based on CPU and BTF support
+  set_fact:
+    falco_driver_kind: >-
+      {{
+        'modern_ebpf'
+        if (
+          (ansible_play_hosts | map('extract', hostvars, ['cpu_v2_check', 'stdout']) | select('equalto', 'x86-64-v1-only') | list | length == 0)
+          and
+          (ansible_play_hosts | map('extract', hostvars, ['kernel_version', 'stdout']) | map('regex_search', '^([0-9]+)') | map('int') | min >= 5)
+        )
+        else (
+          'ebpf'
+          if (ansible_play_hosts | map('extract', hostvars, ['btf_check', 'stdout']) | select('equalto', 'btf-supported') | list | length == ansible_play_hosts | length)
+          else 'kmod'
+        )
+      }}
+  run_once: true
+  delegate_to: "{{ groups['master'][0] }}"
+
+- name: Show selected Falco configuration
+  debug:
+    msg: |
+      ════════════════════════════════════════
+      Chart Helm  : {{ falco_helm_chart_version | default('latest') }}
+      Driver      : {{ falco_driver_kind }}
+      ════════════════════════════════════════
+      {% if falco_helm_chart_version | default('') == '4.8.1' %}
+      ⚠️  CPU x86-64-v1 (QEMU) → Falco 0.38.2
+      {% else %}
+      ✅  CPU x86-64-v2 → Falco 0.43.x
+      {% endif %}
+      {% if falco_driver_kind == 'modern_ebpf' %}
+      ✅  Driver : modern_ebpf (kernel >= 5.8)
+      {% elif falco_driver_kind == 'ebpf' %}
+      ⚠️  Driver : ebpf (BTF présent, QEMU compatible)
+      {% else %}
+      ⚠️  Driver : kmod (fallback universel)
+      {% endif %}
+  run_once: true
+
+# ── ConfigMap pour les règles custom ─────────────────────────────────────────
+- name: Read custom Falco rules template
+  set_fact:
+    falco_custom_rules_content: "{{ lookup('template', 'falco-rules.local.yaml') }}"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Create Falco custom rules ConfigMap
+  shell: |
+    kubectl create namespace falco --dry-run=client -o yaml | kubectl apply -f -
+    kubectl create configmap falco-custom-rules \
+      --namespace falco \
+      --from-literal=falco_rules_local.yaml="{{ falco_custom_rules_content | default('# No custom rules') }}" \
+      --dry-run=client -o yaml | kubectl apply -f -
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+  changed_when: false
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NFS FIX : Migration Redis UI local-path → nfs
+# ORDRE : StatefulSet → Pod → PVC  (spec StatefulSet immuable sous Kubernetes)
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: "[NFS-REDIS] Vérifier StorageClass actuelle du Redis Falcosidekick-UI"
+  shell: |
+    SC=$(kubectl get pvc \
+      falco-falcosidekick-ui-redis-data-falco-falcosidekick-ui-redis-0 \
+      -n falco \
+      -o jsonpath='{.spec.storageClassName}' 2>/dev/null || echo "not_found")
+    echo "$SC"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: redis_current_sc
+  changed_when: false
+
+- name: "[NFS-REDIS] Afficher StorageClass Redis actuelle"
+  debug:
+    msg: "Redis Falcosidekick-UI StorageClass : {{ redis_current_sc.stdout | trim }}"
+  run_once: true
+
+# ── ÉTAPE 1 : Suppression StatefulSet (--cascade=orphan) ─────────────────────
+- name: "[NFS-REDIS] Supprimer StatefulSet Redis (cascade=orphan) si hors NFS"
+  shell: |
+    SC="{{ redis_current_sc.stdout | trim }}"
+    if [ "$SC" = "nfs" ]; then
+      echo "Redis déjà sur NFS — skip StatefulSet"
+      exit 0
+    fi
+    if [ "$SC" = "not_found" ]; then
+      echo "Aucun PVC Redis existant — première installation, skip"
+      exit 0
+    fi
+    echo "→ Suppression StatefulSet falco-falcosidekick-ui-redis (cascade=orphan)..."
+    kubectl delete statefulset falco-falcosidekick-ui-redis \
+      -n falco \
+      --cascade=orphan \
+      --ignore-not-found=true 2>/dev/null || true
+    echo "→ Attente disparition StatefulSet..."
+    for i in $(seq 1 20); do
+      EXISTS=$(kubectl get statefulset falco-falcosidekick-ui-redis \
+        -n falco --ignore-not-found 2>/dev/null | wc -l)
+      echo "  Attempt $i — STS lines: $EXISTS"
+      [ "$EXISTS" = "0" ] && echo "✓ StatefulSet supprimé" && break
+      sleep 3
+    done
+    echo "✓ StatefulSet nettoyé"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: redis_sts_cleanup
+  changed_when: "'StatefulSet nettoyé' in redis_sts_cleanup.stdout"
+  ignore_errors: yes
+
+- name: "[NFS-REDIS] Afficher résultat suppression StatefulSet"
+  debug:
+    msg: "{{ redis_sts_cleanup.stdout_lines }}"
+  run_once: true
+
+# ── ÉTAPE 2 : Suppression Pod + PVC Redis ────────────────────────────────────
+- name: "[NFS-REDIS] Supprimer pod + PVC Redis si hors NFS"
+  shell: |
+    SC="{{ redis_current_sc.stdout | trim }}"
+    if [ "$SC" = "nfs" ]; then
+      echo "Redis déjà sur NFS — skip"
+      exit 0
+    fi
+    if [ "$SC" = "not_found" ]; then
+      echo "Aucun PVC Redis existant — première installation"
+      exit 0
+    fi
+    echo "→ Suppression pod Redis Falcosidekick-UI..."
+    kubectl delete pod falco-falcosidekick-ui-redis-0 \
+      -n falco --force --grace-period=0 \
+      --ignore-not-found=true 2>/dev/null || true
+
+    echo "→ Attente disparition pod Redis..."
+    for i in $(seq 1 20); do
+      EXISTS=$(kubectl get pod falco-falcosidekick-ui-redis-0 \
+        -n falco --ignore-not-found 2>/dev/null | wc -l)
+      echo "  Attempt $i — Pod lines: $EXISTS"
+      [ "$EXISTS" = "0" ] && echo "✓ Pod Redis supprimé" && break
+      sleep 3
+    done
+
+    echo "→ Patch finalizers PVC Redis..."
+    kubectl patch pvc \
+      falco-falcosidekick-ui-redis-data-falco-falcosidekick-ui-redis-0 \
+      -n falco \
+      -p '{"metadata":{"finalizers":[]}}' \
+      --type=merge 2>/dev/null || true
+
+    echo "→ Suppression PVC Redis local-path..."
+    kubectl delete pvc \
+      falco-falcosidekick-ui-redis-data-falco-falcosidekick-ui-redis-0 \
+      -n falco --force --grace-period=0 \
+      --ignore-not-found=true 2>/dev/null || true
+
+    echo "→ Attente suppression PVC..."
+    for i in $(seq 1 30); do
+      EXISTS=$(kubectl get pvc \
+        falco-falcosidekick-ui-redis-data-falco-falcosidekick-ui-redis-0 \
+        -n falco --ignore-not-found 2>/dev/null | wc -l)
+      echo "  Attempt $i — PVC lines: $EXISTS"
+      [ "$EXISTS" = "0" ] && echo "✓ PVC Redis supprimé" && break
+      sleep 5
+    done
+    echo "✓ Nettoyage Redis terminé"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: redis_cleanup_result
+  changed_when: "'Nettoyage Redis terminé' in redis_cleanup_result.stdout"
+  ignore_errors: yes
+
+- name: "[NFS-REDIS] Afficher résultat nettoyage Redis"
+  debug:
+    msg: "{{ redis_cleanup_result.stdout_lines }}"
+  run_once: true
+
+# ── Génération du values.yaml Falco ──────────────────────────────────────────
+- name: Generate Falco values.yaml
+  copy:
+    dest: /tmp/falco-values.yaml
+    content: |
+      driver:
+        kind: {{ falco_driver_kind }}
+
+      falco:
+        json_output: true
+        stdout_output:
+          enabled: true
+        http_output:
+          enabled: true
+          url: "http://falco-falcosidekick:2801"
+        syscall_buf_size_preset: 4
+
+      falcosidekick:
+        enabled: true
+        replicaCount: 2
+        tolerations:
+          - key: "node.kubernetes.io/not-ready"
+            operator: "Exists"
+            effect: "NoExecute"
+            tolerationSeconds: 30
+          - key: "node.kubernetes.io/unreachable"
+            operator: "Exists"
+            effect: "NoExecute"
+            tolerationSeconds: 30
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: falcosidekick
+                topologyKey: kubernetes.io/hostname
+        webui:
+          enabled: true
+          replicaCount: 2
+          tolerations:
+            - key: "node.kubernetes.io/not-ready"
+              operator: "Exists"
+              effect: "NoExecute"
+              tolerationSeconds: 30
+            - key: "node.kubernetes.io/unreachable"
+              operator: "Exists"
+              effect: "NoExecute"
+              tolerationSeconds: 30
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: falcosidekick-ui
+                  topologyKey: kubernetes.io/hostname
+          redis:
+            enabled: true
+            storageClass: nfs
+            tolerations:
+              - key: "node.kubernetes.io/not-ready"
+                operator: "Exists"
+                effect: "NoExecute"
+                tolerationSeconds: 30
+              - key: "node.kubernetes.io/unreachable"
+                operator: "Exists"
+                effect: "NoExecute"
+                tolerationSeconds: 30
+
+      tty: true
+
+      livenessProbe:
+        initialDelaySeconds: 120
+        periodSeconds: 15
+        timeoutSeconds: 10
+        failureThreshold: 5
+
+      readinessProbe:
+        initialDelaySeconds: 60
+        periodSeconds: 15
+        timeoutSeconds: 10
+        failureThreshold: 5
+    mode: "0644"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# ── Installation / upgrade Falco ─────────────────────────────────────────────
+- name: "Install or upgrade Falco (chart: {{ falco_helm_chart_version | default('latest') }}, driver: {{ falco_driver_kind }})"
+  command: >
+    helm upgrade --install falco falcosecurity/falco
+    --namespace falco
+    --create-namespace
+    -f /tmp/falco-values.yaml
+    {% if falco_helm_chart_version | default('') != '' %}
+    --version {{ falco_helm_chart_version }}
+    {% endif %}
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: falco_install
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NFS FIX : Vérification PVC Redis après Helm
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: "[NFS-REDIS] Attendre binding PVC Redis sur NFS"
+  shell: |
+    echo "→ Attente binding PVC NFS Redis..."
+    for i in $(seq 1 30); do
+      SC=$(kubectl get pvc \
+        falco-falcosidekick-ui-redis-data-falco-falcosidekick-ui-redis-0 \
+        -n falco \
+        -o jsonpath='{.spec.storageClassName}' 2>/dev/null || echo "")
+      STATUS=$(kubectl get pvc \
+        falco-falcosidekick-ui-redis-data-falco-falcosidekick-ui-redis-0 \
+        -n falco \
+        -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+      echo "  Attempt $i — StorageClass=$SC Status=$STATUS"
+      if [ "$STATUS" = "Bound" ] && [ "$SC" = "nfs" ]; then
+        echo "✓ PVC Redis NFS Bound"
+        exit 0
+      fi
+      sleep 5
+    done
+    echo "⚠ PVC Redis non Bound après 150s — diagnostic :"
+    kubectl describe pvc \
+      falco-falcosidekick-ui-redis-data-falco-falcosidekick-ui-redis-0 \
+      -n falco 2>/dev/null || true
+    exit 0
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: redis_nfs_bound
+  changed_when: false
+  ignore_errors: yes
+
+- name: "[NFS-REDIS] Afficher statut binding PVC Redis NFS"
+  debug:
+    msg: "{{ redis_nfs_bound.stdout_lines }}"
+  run_once: true
+
+# ── Attente DaemonSet Falco prêt ─────────────────────────────────────────────
+- name: Wait for Falco DaemonSet rollout to complete
+  command: >
+    kubectl rollout status daemonset/falco
+    --namespace falco
+    --timeout=300s
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  retries: 5
+  delay: 15
+  register: falco_rollout
+  until: falco_rollout.rc == 0
+  ignore_errors: yes
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HA FIX v2 : Patch tolerationSeconds=30 sur le DaemonSet Falco
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "[HA-FALCO] Patch tolerationSeconds=30 sur DaemonSet falco (not-ready + unreachable)"
+  shell: |
+    echo "→ Vérification toleration existante..."
+    EXISTING=$(kubectl get daemonset falco -n falco \
+      -o jsonpath='{.spec.template.spec.tolerations}' 2>/dev/null || echo "")
+    echo "  Tolerations actuelles : $EXISTING"
+
+    echo "→ Application patch tolerationSeconds=30..."
+    kubectl patch daemonset falco -n falco --type=json -p '[
+      {
+        "op": "add",
+        "path": "/spec/template/spec/tolerations/-",
+        "value": {
+          "key": "node.kubernetes.io/not-ready",
+          "operator": "Exists",
+          "effect": "NoExecute",
+          "tolerationSeconds": 30
+        }
+      },
+      {
+        "op": "add",
+        "path": "/spec/template/spec/tolerations/-",
+        "value": {
+          "key": "node.kubernetes.io/unreachable",
+          "operator": "Exists",
+          "effect": "NoExecute",
+          "tolerationSeconds": 30
+        }
+      }
+    ]' 2>/dev/null && echo "✓ DaemonSet Falco patché (tolerationSeconds=30)" \
+                  || echo "⚠ Patch échoué ou toleration déjà présente"
+
+    echo "→ Vérification post-patch..."
+    kubectl get daemonset falco -n falco \
+      -o jsonpath='{.spec.template.spec.tolerations}' 2>/dev/null \
+    | jq -r '.[] | "  key=\(.key) effect=\(.effect) tolerationSeconds=\(.tolerationSeconds // "inf")"' \
+    || echo "  (jq non disponible ou tolerations vides)"
+    echo "✓ Patch DaemonSet Falco terminé"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: falco_ds_patch
+  changed_when: "'patché' in falco_ds_patch.stdout"
+  ignore_errors: yes
+
+- name: "[HA-FALCO] Afficher résultat patch DaemonSet"
+  debug:
+    msg: "{{ falco_ds_patch.stdout_lines }}"
+  run_once: true
+
+# ── Attente Falcosidekick prêt (2 replicas) ───────────────────────────────────
+- name: Wait for Falcosidekick deployment to be ready
+  command: >
+    kubectl rollout status deployment/falco-falcosidekick
+    --namespace falco
+    --timeout=180s
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  retries: 3
+  delay: 15
+  register: sidekick_rollout
+  until: sidekick_rollout.rc == 0
+  ignore_errors: yes
+
+# ── Attente Falcosidekick UI prête (2 replicas) ───────────────────────────────
+- name: Wait for Falcosidekick UI deployment to be ready
+  command: >
+    kubectl rollout status deployment/falco-falcosidekick-ui
+    --namespace falco
+    --timeout=180s
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  retries: 3
+  delay: 15
+  register: sidekick_ui_rollout
+  until: sidekick_ui_rollout.rc == 0
+  ignore_errors: yes
+
+# ── Vérification pods ─────────────────────────────────────────────────────────
+- name: Show all Falco pods status
+  command: kubectl get pods -n falco -o wide
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: falco_pods
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display Falco pods
+  debug:
+    msg: "{{ falco_pods.stdout_lines | default(['No pods found']) }}"
+  run_once: true
+
+# ── Vérification HA : anti-affinité respectée ────────────────────────────────
+- name: Verify falcosidekick pods are on different nodes (HA check)
+  shell: |
+    echo "=== falcosidekick ==="
+    kubectl get pods -n falco -l app.kubernetes.io/name=falcosidekick \
+      -o wide --no-headers 2>/dev/null | awk '{print $1, $7}'
+    echo "=== falcosidekick-ui ==="
+    kubectl get pods -n falco -l app.kubernetes.io/name=falcosidekick-ui \
+      -o wide --no-headers 2>/dev/null | awk '{print $1, $7}'
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: falco_ha_check
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display HA placement check
+  debug:
+    msg: "{{ falco_ha_check.stdout_lines | default(['No HA info available']) }}"
+  run_once: true
+
+# ── Vérification tolerations après patch ─────────────────────────────────────
+- name: "[HA-FALCO] Vérifier tolerations sur tous les composants Falco"
+  shell: |
+    check_tolerations() {
+      local KIND=$1
+      local NAME=$2
+      echo "=== $KIND $NAME — tolerations ==="
+      kubectl get "$KIND" "$NAME" -n falco \
+        -o jsonpath='{.spec.template.spec.tolerations}' 2>/dev/null \
+      | jq -r '.[] | "  key=\(.key) effect=\(.effect) tolerationSeconds=\(.tolerationSeconds // "inf")"' \
+      || echo "  (aucune toleration ou ressource introuvable)"
+      echo ""
+    }
+    check_tolerations daemonset   falco
+    check_tolerations deployment  falco-falcosidekick
+    check_tolerations deployment  falco-falcosidekick-ui
+    check_tolerations statefulset falco-falcosidekick-ui-redis
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: falco_toleration_check
+  changed_when: false
+  ignore_errors: yes
+
+- name: "[HA-FALCO] Afficher tolerations de tous les composants Falco"
+  debug:
+    msg: "{{ falco_toleration_check.stdout_lines }}"
+  run_once: true
+
+# ── Vérification finale PVCs Falco ───────────────────────────────────────────
+- name: "[NFS-REDIS] Vérification finale tous les PVC Falco"
+  shell: |
+    echo "=== PVCs namespace falco ==="
+    kubectl get pvc -n falco 2>/dev/null || echo "Aucun PVC"
+    echo ""
+    echo "=== PVCs local-path restants (doit être vide) ==="
+    kubectl get pvc -n falco 2>/dev/null | grep local-path || echo "✓ Aucun PVC local-path — tous sur NFS"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: falco_pvc_final
+  changed_when: false
+  ignore_errors: yes
+
+- name: "[NFS-REDIS] Afficher état final PVCs Falco"
+  debug:
+    msg: "{{ falco_pvc_final.stdout_lines }}"
+  run_once: true
+
+# ── Vérification services ─────────────────────────────────────────────────────
+- name: Show all Falco services
+  command: kubectl get svc -n falco
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: falco_services
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display Falco services
+  debug:
+    msg: "{{ falco_services.stdout_lines | default(['No services found']) }}"
+  run_once: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BUG FIX v3 : Attendre que TOUS les pods Falco soient Running
+# avant de lire les logs — évite l'erreur "PodInitializing"
+# qui se produisait systématiquement juste après helm upgrade
+# quand le dernier pod DaemonSet était encore en cours d'init.
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "[LOGS] Attendre que tous les pods Falco soient Running"
+  shell: |
+    echo "→ Attente que tous les pods Falco soient Running..."
+    for i in $(seq 1 36); do
+      NOT_READY=$(kubectl get pods -n falco \
+        -l app.kubernetes.io/name=falco \
+        --no-headers 2>/dev/null \
+        | grep -v "Running" | grep -v "Completed" | wc -l)
+      TOTAL=$(kubectl get pods -n falco \
+        -l app.kubernetes.io/name=falco \
+        --no-headers 2>/dev/null | wc -l)
+      echo "  Attempt $i — pods not ready: $NOT_READY / total: $TOTAL"
+      if [ "$NOT_READY" = "0" ] && [ "$TOTAL" -gt "0" ]; then
+        echo "✓ Tous les pods Falco sont Running ($TOTAL pods)"
+        exit 0
+      fi
+      sleep 10
+    done
+    echo "⚠ Timeout — certains pods Falco ne sont pas Running après 360s"
+    kubectl get pods -n falco -l app.kubernetes.io/name=falco --no-headers 2>/dev/null
+    exit 0
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: falco_pods_wait
+  changed_when: false
+
+- name: "[LOGS] Afficher résultat attente pods"
+  debug:
+    msg: "{{ falco_pods_wait.stdout_lines }}"
+  run_once: true
+
+- name: "[LOGS] Récupérer logs Falco (uniquement pods Running)"
+  shell: |
+    echo "→ Lecture logs des pods Falco Running uniquement..."
+    PODS=$(kubectl get pods -n falco \
+      -l app.kubernetes.io/name=falco \
+      --no-headers 2>/dev/null \
+      | grep "Running" | awk '{print $1}')
+
+    if [ -z "$PODS" ]; then
+      echo "⚠ Aucun pod Falco en état Running"
+      exit 0
+    fi
+
+    for POD in $PODS; do
+      echo "=== Logs pod: $POD ==="
+      kubectl logs -n falco "$POD" -c falco --tail=50 2>/dev/null || \
+        echo "  (logs non disponibles pour $POD)"
+      echo ""
+    done
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: falco_logs
+  changed_when: false
+
+- name: Display Falco logs
+  debug:
+    msg: "{{ falco_logs.stdout_lines | default(['No logs available']) }}"
+  run_once: true
+
+# ── Affichage formaté des alertes Falco ──────────────────────────────────────
+- name: Check jq is available on master
+  command: which jq
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: jq_check
+  ignore_errors: yes
+  changed_when: false
+
+- name: Install jq if missing
+  package:
+    name: jq
+    state: present
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: jq_check.rc != 0
+  become: yes
+
+- name: Display Falco alerts (formatted – last 100 lines)
+  shell: |
+    kubectl logs -n falco \
+      -l app.kubernetes.io/name=falco \
+      -c falco \
+      --tail=100 \
+      --max-log-requests=10 2>/dev/null \
+    | grep '"rule"' \
+    | jq -r '
+        [
+          .time[11:19],
+          .priority,
+          .rule,
+          .hostname,
+          (.output_fields["proc.name"] // "-")
+        ] | @tsv
+      ' \
+    | awk -F'\t' '{
+        color = "\033[0m"
+        if ($2 == "Warning")                   color = "\033[33m"
+        if ($2 == "Error" || $2 == "Critical") color = "\033[31m"
+        if ($2 == "Notice")                    color = "\033[36m"
+        printf "%s%-8s  %-10s  %-42s  %-15s  %s\033[0m\n",
+               color, $1, $2, $3, $4, $5
+      }' \
+    || echo "No Falco alerts found (JSON output may not be enabled yet)"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+  register: falco_pretty_alerts
+  changed_when: false
+
+- name: Show formatted Falco alerts
+  debug:
+    msg: "{{ falco_pretty_alerts.stdout_lines | default(['No alerts yet']) }}"
+  run_once: true
+
+# ── Résumé final ──────────────────────────────────────────────────────────────
+- name: Falco installation summary
+  debug:
+    msg: |
+      ════════════════════════════════════════════════════════════
+      ✅  Falco + Falcosidekick + UI installés avec succès
+      ────────────────────────────────────────────────────────────
+      Namespace   : falco
+      Chart       : {{ falco_helm_chart_version | default('latest') }}
+      Driver      : {{ falco_driver_kind }}
+      ────────────────────────────────────────────────────────────
+      HA STATUS :
+        falcosidekick    → 2 replicas (anti-affinity: preferred/hostname)
+        falcosidekick-ui → 2 replicas (anti-affinity: preferred/hostname)
+        falcosidekick-ui-redis → StatefulSet 1 replica (PV NFS ✅)
+      ────────────────────────────────────────────────────────────
+      HA TOLERATION STATUS (worker failure recovery) :
+        falco DaemonSet          → tolerationSeconds=30 ✅ (patch kubectl)
+        falcosidekick            → tolerationSeconds=30 ✅ (values.yaml)
+        falcosidekick-ui         → tolerationSeconds=30 ✅ (values.yaml)
+        falcosidekick-ui-redis   → tolerationSeconds=30 ✅ (values.yaml)
+        Comportement : éviction en 30s au lieu de 300s (défaut K8s)
+      ────────────────────────────────────────────────────────────
+      NFS STATUS :
+        falcosidekick-ui-redis → storageClass=nfs ✅ (migré depuis local-path)
+      ────────────────────────────────────────────────────────────
+      🌐  Accès Interface Web Falcosidekick UI :
+
+        kubectl -n falco port-forward --address 0.0.0.0 svc/falco-falcosidekick-ui {{ falcosidekick_ui_nodeport | default(30802) }}:2802
+
+      Navigateur : http://localhost:{{ falcosidekick_ui_nodeport | default(30802) }}/events
+      Login : admin / admin
+
+      ────────────────────────────────────────────────────────────
+      🧪  Déclencher un événement test :
+
+        kubectl exec -it $(kubectl get pods --selector=app=nginx -o name) \
+          -- cat /etc/shadow
+
+      ────────────────────────────────────────────────────────────
+      📋  Vérification PVCs (doit afficher nfs partout) :
+
+        kubectl get pvc -n falco
+
+      ────────────────────────────────────────────────────────────
+      🔍  Vérification tolerations (doit afficher 30s partout) :
+
+        kubectl get daemonset falco -n falco \
+          -o jsonpath='{.spec.template.spec.tolerations}' | jq .
+
+      ────────────────────────────────────────────────────────────
+      📡  Alertes temps réel en CLI :
+
+        kubectl logs -n falco \
+          -l app.kubernetes.io/name=falco \
+          -c falco -f \
+          --max-log-requests=10 2>/dev/null \
+        | grep '"rule"' \
+        | jq -r '[.time[11:19], .priority, .rule, .hostname,
+                  (.output_fields["proc.name"] // "-")] | @tsv' \
+        | awk -F'\t' '{
+            color="\033[0m"
+            if ($2=="Warning")                   color="\033[33m"
+            if ($2=="Error" || $2=="Critical")   color="\033[31m"
+            if ($2=="Notice")                    color="\033[36m"
+            printf "%s%-8s  %-10s  %-42s  %-15s  %s\033[0m\n",
+                   color,$1,$2,$3,$4,$5
+          }'
+      ════════════════════════════════════════════════════════════
+  run_once: true

@@ -1,0 +1,29 @@
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  # Ne pas journaliser les requetes des composants systeme
+  - level: None
+    users:
+      - "system:kube-proxy"
+      - "system:apiserver"
+    verbs: ["watch"]
+    resources:
+      - group: ""
+        resources: ["endpoints", "services", "nodes"]
+
+  # Journaliser les modifications des ressources sensibles
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps"]
+    verbs: ["create", "update", "patch", "delete"]
+
+  # Journaliser toutes les requetes des utilisateurs non systeme (niveau Metadata)
+  - level: Metadata
+    userGroups: ["system:authenticated"]
+    omitStages: ["RequestReceived"]
+
+  # Journaliser les echecs d'authentification
+  - level: Request
+    userGroups: ["system:unauthenticated"]
+

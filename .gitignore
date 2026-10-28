@@ -1,0 +1,14 @@
+.git_backup/
+**/.git_backup/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+*.pem
+*.retry
+.vault_pass
+vault_pass*
+*.bak
+*.save
+*.save.*

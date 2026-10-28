@@ -1,0 +1,27 @@
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  - level: None
+    users:
+      - "system:kube-proxy"
+      - "system:apiserver"
+    verbs: ["watch"]
+    resources:
+      - group: ""
+        resources: ["endpoints", "services", "nodes"]
+
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps"]
+    verbs: ["create", "update", "patch", "delete"]
+
+  - level: Metadata
+    userGroups: ["system:authenticated"]
+    omitStages: ["RequestReceived"]
+
+  - level: Request
+    userGroups: ["system:unauthenticated"]
+
+  - level: Metadata
+    omitStages: ["RequestReceived"]

@@ -1,0 +1,257 @@
+---
+# ============================================================
+# NAMESPACE
+# ============================================================
+- name: Create app namespace
+  command: kubectl get namespace app
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: ns_check
+  failed_when: false
+  changed_when: false
+
+- name: Apply app namespace
+  command: kubectl create namespace app
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: ns_check.rc != 0
+
+# ============================================================
+# FIX: INSTALL INGRESS CONTROLLER (IMPORTANT)
+# ============================================================
+- name: Install NGINX Ingress Controller
+  command: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/baremetal/deploy.yaml
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Wait for ingress-nginx namespace
+  command: kubectl get ns ingress-nginx
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: ns_ing
+  until: ns_ing.rc == 0
+  retries: 20
+  delay: 5
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# ============================================================
+# MANIFESTS — écriture sur le master
+# ============================================================
+
+- name: Write nginx Deployment manifest
+  copy:
+    dest: /tmp/nginx-deployment.yaml
+    content: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: nginx-app
+        namespace: app
+      spec:
+        replicas: 2
+        selector:
+          matchLabels:
+            app: nginx-app
+        template:
+          metadata:
+            labels:
+              app: nginx-app
+          spec:
+            containers:
+            - name: nginx
+              image: nginx:latest
+              ports:
+              - containerPort: 80
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Write nginx Service manifest
+  copy:
+    dest: /tmp/nginx-service.yaml
+    content: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: nginx-service
+        namespace: app
+      spec:
+        selector:
+          app: nginx-app
+        ports:
+        - port: 80
+          targetPort: 80
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Write nginx Ingress manifest
+  copy:
+    dest: /tmp/nginx-ingress.yaml
+    content: |
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: nginx-ingress
+        namespace: app
+        annotations:
+          nginx.ingress.kubernetes.io/ssl-redirect: "true"
+          nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+      spec:
+        ingressClassName: nginx
+        tls:
+        - hosts:
+          - nginx.local
+          secretName: nginx-tls-secret
+        rules:
+        - host: nginx.local
+          http:
+            paths:
+            - path: /
+              pathType: Prefix
+              backend:
+                service:
+                  name: nginx-service
+                  port:
+                    number: 80
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# ============================================================
+# APPLY MANIFESTS
+# ============================================================
+
+- name: Apply nginx Deployment
+  command: kubectl apply -f /tmp/nginx-deployment.yaml
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Apply nginx Service
+  command: kubectl apply -f /tmp/nginx-service.yaml
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# ============================================================
+# TLS CERTIFICATE
+# ============================================================
+
+- name: Check if TLS secret already exists
+  command: kubectl get secret nginx-tls-secret -n app
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: tls_secret_check
+  failed_when: false
+  changed_when: false
+
+- name: Generate self-signed TLS certificate
+  command: >
+    openssl req -x509 -nodes -days 365
+    -newkey rsa:2048
+    -keyout /tmp/tls.key
+    -out /tmp/tls.crt
+    -subj "/CN=nginx.local/O=nginx.local"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: tls_secret_check.rc != 0
+
+- name: Create TLS secret
+  command: >
+    kubectl create secret tls nginx-tls-secret
+    --cert=/tmp/tls.crt
+    --key=/tmp/tls.key
+    --namespace app
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: tls_secret_check.rc != 0
+
+# ============================================================
+# APPLY INGRESS
+# ============================================================
+
+- name: Apply nginx Ingress
+  command: kubectl apply -f /tmp/nginx-ingress.yaml
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# ============================================================
+# WAIT FOR PODS
+# ============================================================
+
+- name: Wait for nginx pods to be ready
+  command: >
+    kubectl wait --for=condition=Ready pod
+    -l app=nginx-app -n app
+    --timeout=120s
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  retries: 3
+  delay: 20
+  register: nginx_wait
+  until: nginx_wait.rc == 0
+
+# ============================================================
+# FIX: WAIT INGRESS SERVICE (IMPORTANT)
+# ============================================================
+
+- name: Wait ingress service
+  command: kubectl get svc ingress-nginx-controller -n ingress-nginx
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: ingress_svc
+  until: ingress_svc.rc == 0
+  retries: 20
+  delay: 10
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# ============================================================
+# OUTPUT
+# ============================================================
+
+- name: Get Ingress HTTPS NodePort
+  command: >
+    kubectl get svc ingress-nginx-controller
+    -n ingress-nginx
+    -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}'
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  register: ingress_https_port
+  run_once: true
+  changed_when: false
+
+- name: Show access info
+  debug:
+    msg:
+      - "✅ App deployed successfully"
+      - "👉 Add to /etc/hosts: {{ hostvars[groups['master'][0]]['ansible_host'] }} nginx.local"
+      - "🌐 Access via: https://nginx.local:{{ ingress_https_port.stdout }}"
+      - "🔒 TLS: self-signed certificate (use -k with curl)"
+  run_once: true
+- name: STOP AFTER PHASE 5
+  debug:
+    msg:
+      - "🛑 Phase 5 completed successfully"
+      - "🚀 Cluster + App + Ingress + TLS READY"
+      - "❌ Stopping before audit/falco/trivy phases"
+
+  run_once: true
+
+- meta: end_play

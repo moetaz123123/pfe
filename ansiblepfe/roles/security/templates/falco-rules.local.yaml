@@ -1,0 +1,10 @@
+- rule: Write below binary directories
+  desc: Attempt to write to any binary directory
+  condition: >
+    (open_write and fd.directory in (bin_dir))
+  output: >
+    File below a binary directory opened for writing (user=%user.name
+    command=%proc.cmdline file=%fd.name)
+  priority: CRITICAL
+  tags: [filesystem]
+

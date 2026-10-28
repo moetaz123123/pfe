@@ -1,0 +1,122 @@
+---
+- name: Update apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install required packages
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+      - software-properties-common
+      - python3-pip
+      - iptables
+      - arptables
+      - ebtables
+    state: present
+
+- name: Disable swap immediately
+  command: swapoff -a
+  changed_when: false
+
+- name: Disable swap permanently
+  mount:
+    name: swap
+    fstype: swap
+    state: absent
+
+- name: Switch to iptables-legacy (fix nftables incompatibility with kube-proxy)
+  shell: |
+    update-alternatives --install /usr/sbin/iptables iptables /usr/sbin/iptables-legacy 100 2>/dev/null || true
+    update-alternatives --install /usr/sbin/ip6tables ip6tables /usr/sbin/ip6tables-legacy 100 2>/dev/null || true
+    update-alternatives --install /usr/sbin/arptables arptables /usr/sbin/arptables-legacy 100 2>/dev/null || true
+    update-alternatives --install /usr/sbin/ebtables ebtables /usr/sbin/ebtables-legacy 100 2>/dev/null || true
+  changed_when: false
+  ignore_errors: yes
+
+# ============================================================
+# FIX — Désactiver nftables (conflit avec iptables-legacy)
+# ============================================================
+- name: Stop nftables service
+  systemd:
+    name: nftables
+    state: stopped
+    enabled: false
+  ignore_errors: yes
+
+- name: Flush nftables ruleset
+  command: nft flush ruleset
+  ignore_errors: yes
+
+# ============================================================
+# FIX — Ajouter hostname master-01 dans /etc/hosts
+# ============================================================
+- name: Remove old master-01 entry from /etc/hosts
+  lineinfile:
+    path: /etc/hosts
+    regexp: '.*master-01.*'
+    state: absent
+
+- name: Add master-01 hostname to /etc/hosts
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ hostvars[groups['master'][0]]['ansible_host'] }} {{ groups['master'][0] }}"
+    state: present
+
+# ============================================================
+# FIX — Ajouter tous les workers dans /etc/hosts
+# ============================================================
+- name: Remove old worker entries from /etc/hosts
+  lineinfile:
+    path: /etc/hosts
+    regexp: ".*{{ item }}.*"
+    state: absent
+  loop: "{{ groups['workers'] }}"
+
+- name: Add worker hostnames to /etc/hosts
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ hostvars[item]['ansible_host'] }} {{ item }}"
+    state: present
+  loop: "{{ groups['workers'] }}"
+
+- name: Load kernel modules
+  command: "modprobe {{ item }}"
+  loop:
+    - overlay
+    - br_netfilter
+    - vxlan
+    - ip_tables
+    - iptable_nat
+    - iptable_filter
+    - nf_conntrack
+  changed_when: false
+  ignore_errors: yes
+
+- name: Persist kernel modules for reboot
+  copy:
+    dest: /etc/modules-load.d/k8s.conf
+    mode: "0644"
+    content: |
+      overlay
+      br_netfilter
+      vxlan
+      ip_tables
+      iptable_nat
+      iptable_filter
+      nf_conntrack
+
+- name: Configure sysctl parameters
+  sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: yes
+  loop:
+    - { name: "net.bridge.bridge-nf-call-iptables",  value: "1" }
+    - { name: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
+    - { name: "net.ipv4.ip_forward",                 value: "1" }

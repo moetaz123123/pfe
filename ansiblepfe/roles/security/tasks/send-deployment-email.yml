@@ -1,0 +1,676 @@
+---
+# Email Report Tasks with SMTP Configuration
+
+- name: Gather all deployment information for email report
+  set_fact:
+    deployment_info:
+      project_name: "{{ project_name | default('CloudStack Kubernetes') }}"
+      deployment_date: "{{ ansible_date_time.iso8601 }}"
+      cluster_master: "{{ hostvars[groups['master'][0]]['ansible_host'] }}"
+      cluster_workers: "{{ groups['workers'] | length }}"
+      worker_ips: "{{ groups['workers'] | map('extract', hostvars, 'ansible_host') | list }}"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Get Grafana port and credentials
+  shell: |
+    GRAFANA_PORT=$(kubectl get svc loki-grafana -n monitoring -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || echo "32000")
+    GRAFANA_PASS=$(kubectl get secret loki-grafana -n monitoring -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d || echo "Admin1234!")
+    echo "GRAFANA_PORT=$GRAFANA_PORT"
+    echo "GRAFANA_PASS=$GRAFANA_PASS"
+  register: grafana_info
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Parse Grafana info
+  set_fact:
+    grafana_port: "{{ grafana_info.stdout_lines[0].split('=')[1] }}"
+    grafana_password: "{{ grafana_info.stdout_lines[1].split('=')[1] }}"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Install mutt and msmtp for email
+  apt:
+    name:
+      - mutt
+      - msmtp
+      - msmtp-mta
+    state: present
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Create msmtp config directory
+  file:
+    path: /root/.msmtprc
+    state: touch
+    mode: '0600'
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Configure msmtp for Gmail SMTP
+  copy:
+    dest: /root/.msmtprc
+    mode: '0600'
+    content: |
+      defaults
+      auth           on
+      tls            on
+      tls_trust_file /etc/ssl/certs/ca-certificates.crt
+      logfile        ~/.msmtp.log
+
+      account        gmail
+      host           {{ smtp_host }}
+      port           {{ smtp_port }}
+      from           {{ smtp_from }}
+      user           {{ smtp_user }}
+      password       {{ smtp_password }}
+
+      account default : gmail
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Configure mutt to use msmtp
+  copy:
+    dest: /root/.muttrc
+    mode: '0644'
+    content: |
+      set sendmail="/usr/bin/msmtp"
+      set from="{{ smtp_from }}"
+      set realname="CloudStack Kubernetes Deployment"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Generate deployment summary text attachment
+  copy:
+    dest: /tmp/deployment-summary.txt
+    content: |
+      ================================================
+       {{ deployment_info.project_name | upper }}
+       DEPLOYMENT SUMMARY
+      ================================================
+      Date         : {{ deployment_info.deployment_date }}
+      Projet       : {{ deployment_info.project_name }}
+      Master       : {{ deployment_info.cluster_master }}
+      Workers      : {{ deployment_info.cluster_workers }} nœud(s)
+      Worker IPs   : {{ deployment_info.worker_ips | join(', ') }}
+
+      ------------------------------------------------
+       GRAFANA MONITORING
+      ------------------------------------------------
+      URL          : http://{{ deployment_info.cluster_master }}:{{ grafana_port }}
+      Login        : admin
+      Password     : {{ grafana_password }}
+      Dashboard 1  : Kubernetes Audit Log
+      Dashboard 2  : Cluster Logs - Global Traffic
+
+      ------------------------------------------------
+       AUDIT LOGGING
+      ------------------------------------------------
+      Fichier      : /var/log/kubernetes/audit.log
+      Rétention    : 30 jours · 10 backups · 100MB/fichier
+
+      Commandes CLI :
+        audit-log watch          → live stream coloré
+        audit-log errors         → requêtes refusées (403)
+        audit-log secrets        → accès aux secrets
+        audit-log deletes        → toutes les suppressions
+        audit-log stats          → résumé statistique
+        audit-log node <name>    → activité d'un nœud
+
+      ------------------------------------------------
+       CLUSTER LOGS
+      ------------------------------------------------
+        cluster-logs errors      → logs d'erreur
+        cluster-logs warnings    → avertissements
+        cluster-logs namespaces  → namespaces actifs
+        cluster-logs pods <ns>   → pods d'un namespace
+        cluster-logs status      → état des DaemonSets
+
+      ------------------------------------------------
+       OUTILS DE SÉCURITÉ
+      ------------------------------------------------
+      DefectDojo   : http://{{ deployment_info.cluster_master }}:8080
+      Falco UI     : http://{{ deployment_info.cluster_master }}:{{ falcosidekick_ui_nodeport | default(30802) }}/events
+      Kube-Bench   : /var/log/kube-bench-report-{{ ansible_date_time.date }}.log
+      Kube-Hunter  : /var/log/kube-hunter-report-{{ ansible_date_time.date }}.log
+
+      ================================================
+       Rapport généré automatiquement par Ansible
+      ================================================
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Generate professional HTML email report
+  copy:
+    dest: /tmp/deployment-report.html
+    content: |
+      <!DOCTYPE html>
+      <html lang="fr">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Rapport de Déploiement - {{ deployment_info.project_name }}</title>
+        <style>
+          * { margin: 0; padding: 0; box-sizing: border-box; }
+          body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-size: 14px;
+            line-height: 1.6;
+            color: #1a202c;
+            background-color: #edf2f7;
+          }
+          .email-wrapper {
+            max-width: 700px;
+            margin: 30px auto;
+            background: #ffffff;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.10);
+          }
+          .header {
+            background: linear-gradient(135deg, #1a365d 0%, #2b6cb0 60%, #3182ce 100%);
+            padding: 36px 40px 28px 40px;
+            color: #fff;
+          }
+          .header .badge {
+            display: inline-block;
+            background: rgba(255,255,255,0.15);
+            border: 1px solid rgba(255,255,255,0.3);
+            border-radius: 20px;
+            padding: 4px 14px;
+            font-size: 11px;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            margin-bottom: 14px;
+            color: #bee3f8;
+          }
+          .header h1 {
+            font-size: 26px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            margin-bottom: 6px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+          }
+          .header .subtitle { font-size: 13px; color: #bee3f8; margin-bottom: 20px; }
+          .header .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: #38a169;
+            border-radius: 20px;
+            padding: 7px 18px;
+            font-size: 13px;
+            font-weight: 600;
+          }
+          .header .status-pill .dot {
+            width: 8px; height: 8px;
+            background: #9ae6b4;
+            border-radius: 50%;
+          }
+          .header .meta {
+            margin-top: 16px;
+            font-size: 12px;
+            color: #90cdf4;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+          }
+          .header .meta svg { vertical-align: middle; }
+          .content { padding: 0 40px 40px 40px; }
+          .cards-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 14px;
+            margin: 28px 0 0 0;
+            padding: 24px 0 0 0;
+          }
+          .card {
+            background: #f7fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            padding: 18px 16px;
+            text-align: center;
+          }
+          .card .card-value { font-size: 28px; font-weight: 800; color: #2b6cb0; line-height: 1; margin-bottom: 4px; }
+          .card .card-label { font-size: 11px; color: #718096; text-transform: uppercase; letter-spacing: 0.8px; }
+          .section { margin-top: 32px; border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; }
+          .section-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 14px 20px;
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.4px;
+            text-transform: uppercase;
+          }
+          .section-header svg { flex-shrink: 0; }
+          .section-header.blue   { background: #ebf8ff; color: #2b6cb0; border-bottom: 1px solid #bee3f8; }
+          .section-header.green  { background: #f0fff4; color: #276749; border-bottom: 1px solid #9ae6b4; }
+          .section-header.purple { background: #faf5ff; color: #553c9a; border-bottom: 1px solid #d6bcfa; }
+          .section-header.orange { background: #fffaf0; color: #c05621; border-bottom: 1px solid #fbd38d; }
+          .section-header.gray   { background: #f7fafc; color: #2d3748; border-bottom: 1px solid #e2e8f0; }
+          .section-header.red    { background: #fff5f5; color: #9b2c2c; border-bottom: 1px solid #feb2b2; }
+          .section-body { padding: 20px; }
+          .info-table { width: 100%; border-collapse: collapse; }
+          .info-table td { padding: 9px 12px; border-bottom: 1px solid #edf2f7; font-size: 13px; vertical-align: top; }
+          .info-table td:first-child { width: 38%; color: #718096; font-weight: 600; }
+          .info-table td:last-child { color: #2d3748; }
+          .info-table tr:last-child td { border-bottom: none; }
+          .cmd-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+          .cmd-table th { background: #2d3748; color: #e2e8f0; padding: 9px 14px; text-align: left; font-size: 11px; letter-spacing: 0.8px; text-transform: uppercase; }
+          .cmd-table td { padding: 9px 14px; border-bottom: 1px solid #edf2f7; font-size: 12px; }
+          .cmd-table tr:last-child td { border-bottom: none; }
+          .cmd-table tr:nth-child(even) td { background: #f7fafc; }
+          .cmd-code { font-family: 'Courier New', monospace; background: #2d3748; color: #68d391; padding: 3px 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; }
+          .access-box { background: linear-gradient(135deg, #1a365d, #2b6cb0); border-radius: 8px; padding: 20px; color: white; margin-bottom: 12px; }
+          .access-box.dark { background: linear-gradient(135deg, #1a202c, #2d3748); }
+          .access-box .access-title {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #90cdf4;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+          }
+          .access-box.dark .access-title { color: #a0aec0; }
+          .access-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 13px; }
+          .access-row:last-child { margin-bottom: 0; }
+          .access-row .alabel { color: #90cdf4; width: 90px; font-size: 11px; }
+          .access-box.dark .access-row .alabel { color: #a0aec0; }
+          .access-row .avalue { font-family: 'Courier New', monospace; background: rgba(255,255,255,0.12); padding: 4px 10px; border-radius: 4px; color: #fff; font-size: 13px; font-weight: 600; }
+          .access-row .avalue.url { color: #76e4f7; }
+          .access-row .avalue.small { font-size: 11px; word-break: break-all; white-space: normal; }
+          .checklist { list-style: none; padding: 0; }
+          .checklist li { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; border-bottom: 1px solid #edf2f7; font-size: 13px; color: #2d3748; }
+          .checklist li:last-child { border-bottom: none; }
+          .checklist .icon { flex-shrink: 0; width: 20px; height: 20px; background: #c6f6d5; color: #276749; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 800; }
+          .checklist strong { color: #2b6cb0; }
+          .ret-table { width: 100%; border-collapse: collapse; }
+          .ret-table th { background: #4a5568; color: #e2e8f0; padding: 10px 14px; text-align: left; font-size: 11px; letter-spacing: 0.8px; text-transform: uppercase; }
+          .ret-table td { padding: 10px 14px; border-bottom: 1px solid #edf2f7; font-size: 13px; }
+          .ret-table tr:last-child td { border-bottom: none; }
+          .ret-table tr:nth-child(even) td { background: #f7fafc; }
+          .badge-green { display: inline-block; background: #c6f6d5; color: #276749; padding: 2px 9px; border-radius: 12px; font-size: 11px; font-weight: 700; }
+          .badge-blue  { display: inline-block; background: #bee3f8; color: #2b6cb0; padding: 2px 9px; border-radius: 12px; font-size: 11px; font-weight: 700; }
+          .step-item { display: flex; gap: 16px; align-items: flex-start; padding: 14px 0; border-bottom: 1px solid #edf2f7; }
+          .step-item:last-child { border-bottom: none; }
+          .step-num { flex-shrink: 0; width: 30px; height: 30px; background: #2b6cb0; color: white; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 800; }
+          .step-content h4 { font-size: 13px; color: #2d3748; margin-bottom: 3px; }
+          .step-content p { font-size: 12px; color: #718096; }
+          .step-cmd { display: inline-block; font-family: 'Courier New', monospace; background: #2d3748; color: #68d391; padding: 2px 8px; border-radius: 4px; font-size: 11px; margin-top: 4px; }
+          .worker-pill { display: inline-block; background: #ebf8ff; border: 1px solid #bee3f8; color: #2b6cb0; border-radius: 6px; padding: 3px 10px; font-family: monospace; font-size: 12px; margin: 3px 2px; }
+          .security-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+          .footer { background: #2d3748; color: #a0aec0; text-align: center; padding: 22px 40px; font-size: 11px; line-height: 1.8; }
+          .footer strong { color: #e2e8f0; }
+          .footer .divider { margin: 8px 0; border: none; border-top: 1px solid #4a5568; }
+          .footer a { color: #63b3ed; text-decoration: none; }
+        </style>
+      </head>
+      <body>
+        <div class="email-wrapper">
+          <div class="header">
+            <div class="badge">Rapport Automatisé · Ansible</div>
+            <h1>
+              <svg xmlns="http://www.w3.org/2000/svg" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></svg>
+              Déploiement Kubernetes
+            </h1>
+            <div class="subtitle">{{ deployment_info.project_name }} · Audit Logging, Monitoring &amp; Security Stack</div>
+            <div class="status-pill">
+              <span class="dot"></span>
+              Déploiement terminé avec succès
+            </div>
+            <div class="meta">
+              <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#90cdf4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2" ry="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>
+              {{ deployment_info.deployment_date }}
+              &nbsp;|&nbsp;
+              <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#90cdf4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>
+              Master: {{ deployment_info.cluster_master }}
+              &nbsp;|&nbsp;
+              <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#90cdf4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+              {{ deployment_info.cluster_workers }} Worker(s)
+            </div>
+          </div>
+
+          <div class="content">
+            <div class="cards-grid">
+              <div class="card">
+                <div class="card-value">{{ deployment_info.cluster_workers }}</div>
+                <div class="card-label">Worker Nodes</div>
+              </div>
+              <div class="card">
+                <div class="card-value">2</div>
+                <div class="card-label">Dashboards</div>
+              </div>
+              <div class="card">
+                <div class="card-value">10Gi</div>
+                <div class="card-label">Stockage Loki</div>
+              </div>
+              <div class="card">
+                <div class="card-value">4</div>
+                <div class="card-label">Outils Sécu</div>
+              </div>
+            </div>
+
+            <div class="section">
+              <div class="section-header blue">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18M3 15h18M9 3v18"/></svg>
+                Architecture du Cluster
+              </div>
+              <div class="section-body">
+                <table class="info-table">
+                  <tr><td>Master Node</td><td><span class="cmd-code">{{ deployment_info.cluster_master }}</span></td></tr>
+                  <tr><td>Nombre de Workers</td><td><strong>{{ deployment_info.cluster_workers }} nœuds</strong></td></tr>
+                  <tr>
+                    <td>IPs Workers</td>
+                    <td>
+                      {% for ip in deployment_info.worker_ips %}
+                      <span class="worker-pill">{{ ip }}</span>
+                      {% endfor %}
+                    </td>
+                  </tr>
+                  <tr><td>Distribution Promtail</td><td>Tous les nœuds (DaemonSet)</td></tr>
+                </table>
+              </div>
+            </div>
+
+            <div class="section">
+              <div class="section-header green">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#276749" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                Audit Logging · API Kubernetes
+              </div>
+              <div class="section-body">
+                <table class="info-table">
+                  <tr><td>Statut</td><td><span class="badge-green">&#10003; ACTIF</span></td></tr>
+                  <tr><td>Emplacement</td><td><span class="cmd-code">/var/log/kubernetes/audit.log</span></td></tr>
+                  <tr><td>Rétention</td><td>30 jours · 10 backups maximum</td></tr>
+                  <tr><td>Rotation</td><td>100 MB par fichier</td></tr>
+                </table>
+                <table class="cmd-table">
+                  <tr><th>Commande CLI</th><th>Description</th></tr>
+                  <tr><td><span class="cmd-code">audit-log watch</span></td><td>Stream en temps réel coloré</td></tr>
+                  <tr><td><span class="cmd-code">audit-log errors</span></td><td>Requêtes refusées (403)</td></tr>
+                  <tr><td><span class="cmd-code">audit-log secrets</span></td><td>Accès aux secrets</td></tr>
+                  <tr><td><span class="cmd-code">audit-log deletes</span></td><td>Toutes les suppressions</td></tr>
+                  <tr><td><span class="cmd-code">audit-log stats</span></td><td>Résumé statistique</td></tr>
+                  <tr><td><span class="cmd-code">audit-log node &lt;name&gt;</span></td><td>Activité d'un nœud spécifique</td></tr>
+                </table>
+              </div>
+            </div>
+
+            <div class="section">
+              <div class="section-header blue">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                Collecte Globale de Logs · Cluster Monitoring
+              </div>
+              <div class="section-body">
+                <table class="info-table">
+                  <tr><td>Agent</td><td><strong>Promtail DaemonSet</strong></td></tr>
+                  <tr><td>Couverture</td><td>Tous les nœuds (master + workers)</td></tr>
+                  <tr>
+                    <td>Sources collectées</td>
+                    <td>
+                      Containers stdout/stderr · <span class="cmd-code">/var/log/containers/*.log</span><br>
+                      Logs système (syslog) · Logs kernel (dmesg) · Logs kubelet
+                    </td>
+                  </tr>
+                </table>
+                <table class="cmd-table">
+                  <tr><th>Commande CLI</th><th>Description</th></tr>
+                  <tr><td><span class="cmd-code">cluster-logs errors</span></td><td>Logs d'erreur du cluster</td></tr>
+                  <tr><td><span class="cmd-code">cluster-logs warnings</span></td><td>Avertissements</td></tr>
+                  <tr><td><span class="cmd-code">cluster-logs namespaces</span></td><td>Namespaces actifs</td></tr>
+                  <tr><td><span class="cmd-code">cluster-logs pods &lt;ns&gt;</span></td><td>Pods d'un namespace</td></tr>
+                  <tr><td><span class="cmd-code">cluster-logs top</span></td><td>Top 10 pods par volume de logs</td></tr>
+                </table>
+              </div>
+            </div>
+
+            <div class="section">
+              <div class="section-header purple">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#553c9a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                Stack de Monitoring · Loki + Grafana
+              </div>
+              <div class="section-body">
+                <div class="access-box">
+                  <div class="access-title">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#90cdf4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" x2="22" y1="12" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                    Accès Grafana
+                  </div>
+                  <div class="access-row">
+                    <span class="alabel">URL</span>
+                    <span class="avalue url">http://{{ deployment_info.cluster_master }}:{{ grafana_port }}</span>
+                  </div>
+                  <div class="access-row">
+                    <span class="alabel">Login</span>
+                    <span class="avalue">admin</span>
+                  </div>
+                  <div class="access-row">
+                    <span class="alabel">Mot de passe</span>
+                    <span class="avalue">{{ grafana_password }}</span>
+                  </div>
+                </div>
+                <table class="cmd-table">
+                  <tr><th>Dashboard</th><th>Description</th></tr>
+                  <tr><td><strong>Kubernetes Audit Log</strong></td><td>Requêtes API détaillées</td></tr>
+                  <tr><td><strong>Cluster Logs - Global Traffic</strong></td><td>Tous les logs du cluster en temps réel</td></tr>
+                </table>
+              </div>
+            </div>
+
+            <div class="section">
+              <div class="section-header red">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9b2c2c" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                Outils de Sécurité
+              </div>
+              <div class="section-body">
+                <div class="security-grid">
+                  <div class="access-box dark">
+                    <div class="access-title">
+                      <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#a0aec0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" x2="16.65" y1="21" y2="16.65"/></svg>
+                      DefectDojo · Trivy
+                    </div>
+                    <div class="access-row">
+                      <span class="alabel">URL</span>
+                      <span class="avalue url">http://{{ deployment_info.cluster_master }}:8080</span>
+                    </div>
+                    <div class="access-row">
+                      <span class="alabel">Port-forward</span>
+                      <span class="avalue small">kubectl port-forward svc/defectdojo-django 8080:80 -n defectdojo --address 0.0.0.0</span>
+                    </div>
+                  </div>
+                  <div class="access-box dark">
+                    <div class="access-title">
+                      <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#a0aec0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" x2="12" y1="9" y2="13"/><line x1="12" x2="12.01" y1="17" y2="17"/></svg>
+                      Falco Sidekick UI
+                    </div>
+                    <div class="access-row">
+                      <span class="alabel">URL</span>
+                      <span class="avalue url">http://{{ deployment_info.cluster_master }}:{{ falcosidekick_ui_nodeport | default(30802) }}/events</span>
+                    </div>
+                    <div class="access-row">
+                      <span class="alabel">Port-forward (optionnel)</span>
+                      <span class="avalue small">kubectl -n falco port-forward --address 0.0.0.0 svc/falco-falcosidekick-ui 2802:2802</span>
+                    </div>
+                  </div>
+                </div>
+                <table class="ret-table">
+                  <tr><th>Outil</th><th>Rapport</th><th>Statut</th></tr>
+                  <tr>
+                    <td><strong>Kube-Hunter</strong></td>
+                    <td><span class="cmd-code">/var/log/kube-hunter-report-{{ ansible_date_time.date }}.log</span></td>
+                    <td><span class="badge-green">&#10003; Généré</span></td>
+                  </tr>
+                  <tr>
+                    <td><strong>Kube-Bench</strong></td>
+                    <td><span class="cmd-code">/var/log/kube-bench-report-{{ ansible_date_time.date }}.log</span></td>
+                    <td><span class="badge-green">&#10003; Généré</span></td>
+                  </tr>
+                </table>
+              </div>
+            </div>
+
+            <div class="section">
+              <div class="section-header orange">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#c05621" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                Visibilité &amp; Traçabilité Complète
+              </div>
+              <div class="section-body">
+                <ul class="checklist">
+                  <li><span class="icon">&#10003;</span><span><strong>100% du trafic API</strong> — Chaque appel au cluster est loggé</span></li>
+                  <li><span class="icon">&#10003;</span><span><strong>Logs d'applications</strong> — stdout/stderr de tous les pods</span></li>
+                  <li><span class="icon">&#10003;</span><span><strong>Logs système</strong> — syslog, kernel, kubelet centralisés</span></li>
+                  <li><span class="icon">&#10003;</span><span><strong>Détection d'anomalies</strong> — Erreurs et warnings en temps réel</span></li>
+                  <li><span class="icon">&#10003;</span><span><strong>Audit complet</strong> — Qui a fait quoi, où, quand</span></li>
+                  <li><span class="icon">&#10003;</span><span><strong>Trace des délétions</strong> — Chaque suppression est enregistrée</span></li>
+                  <li><span class="icon">&#10003;</span><span><strong>Accès sensibles</strong> — Secrets et ConfigMaps sous surveillance</span></li>
+                  <li><span class="icon">&#10003;</span><span><strong>Scan de vulnérabilités</strong> — Résultats Trivy centralisés dans DefectDojo</span></li>
+                  <li><span class="icon">&#10003;</span><span><strong>Détection runtime</strong> — Comportements suspects via Falco</span></li>
+                  <li><span class="icon">&#10003;</span><span><strong>Conformité CIS</strong> — Benchmark kube-bench sur tous les nœuds</span></li>
+                </ul>
+              </div>
+            </div>
+
+            <div class="section">
+              <div class="section-header gray">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2d3748" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+                Stockage &amp; Rétention
+              </div>
+              <div class="section-body">
+                <table class="ret-table">
+                  <tr><th>Type</th><th>Rétention</th><th>Taille</th><th>Rotation</th></tr>
+                  <tr><td><strong>Audit Logs</strong></td><td><span class="badge-blue">30 jours</span></td><td>100 MB / fichier</td><td>10 backups</td></tr>
+                  <tr><td><strong>Loki (tous les logs)</strong></td><td><span class="badge-green">Persistant</span></td><td>10 Gi</td><td>Automatique</td></tr>
+                  <tr><td><strong>Rapports Sécurité</strong></td><td><span class="badge-blue">Par date</span></td><td>—</td><td>/var/log/</td></tr>
+                </table>
+              </div>
+            </div>
+
+            <div class="section">
+              <div class="section-header blue">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/></svg>
+                Prochaines Étapes
+              </div>
+              <div class="section-body">
+                <div class="step-item">
+                  <div class="step-num">1</div>
+                  <div class="step-content">
+                    <h4>Accéder aux Dashboards Grafana</h4>
+                    <p>Consultez les deux dashboards pour une visibilité complète du cluster en temps réel.</p>
+                  </div>
+                </div>
+                <div class="step-item">
+                  <div class="step-num">2</div>
+                  <div class="step-content">
+                    <h4>Tester les Commandes CLI</h4>
+                    <p>Connectez-vous au master node et testez:</p>
+                    <span class="step-cmd">audit-log help</span>
+                    &nbsp;
+                    <span class="step-cmd">cluster-logs help</span>
+                  </div>
+                </div>
+                <div class="step-item">
+                  <div class="step-num">3</div>
+                  <div class="step-content">
+                    <h4>Consulter les Rapports de Sécurité</h4>
+                    <span class="step-cmd">cat /var/log/kube-bench-report-*.log</span>
+                    &nbsp;
+                    <span class="step-cmd">cat /var/log/kube-hunter-report-*.log</span>
+                  </div>
+                </div>
+                <div class="step-item">
+                  <div class="step-num">4</div>
+                  <div class="step-content">
+                    <h4>Configurer les Alertes Grafana</h4>
+                    <p>Créez des alertes sur les panneaux erreurs/warnings pour être notifié proactivement.</p>
+                  </div>
+                </div>
+                <div class="step-item">
+                  <div class="step-num">5</div>
+                  <div class="step-content">
+                    <h4>Traiter les Vulnérabilités dans DefectDojo</h4>
+                    <p>Accédez à DefectDojo pour trier et assigner les findings Trivy à l'équipe de sécurité.</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+          </div>
+
+          <div class="footer">
+            <strong>{{ deployment_info.project_name }}</strong><br>
+            Rapport généré automatiquement · {{ deployment_info.deployment_date }}<br>
+            <hr class="divider">
+            Documentation:
+            <a href="https://grafana.com/docs/loki/">Loki</a> ·
+            <a href="https://grafana.com/docs/grafana/">Grafana</a> ·
+            <a href="https://kubernetes.io/docs/tasks/debug-application-cluster/audit/">Kubernetes Audit</a> ·
+            <a href="https://defectdojo.com/docs/">DefectDojo</a> ·
+            <a href="https://falco.org/docs/">Falco</a>
+          </div>
+
+        </div>
+      </body>
+      </html>
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Send professional HTML deployment report email with SMTP
+  shell: |
+    EMAIL_TO="{{ email_recipient }}"
+    EMAIL_SUBJECT="[{{ deployment_info.project_name }}] Rapport de Déploiement – $(date '+%d/%m/%Y %H:%M')"
+
+    if [ -f /tmp/deployment-summary.txt ]; then
+      mutt -e "set content_type=text/html" \
+           -s "$EMAIL_SUBJECT" \
+           -a "/tmp/deployment-summary.txt" \
+           -- "$EMAIL_TO" < /tmp/deployment-report.html
+    else
+      mutt -e "set content_type=text/html" \
+           -s "$EMAIL_SUBJECT" \
+           -- "$EMAIL_TO" < /tmp/deployment-report.html
+    fi
+
+    echo "Email professionnel envoyé à: $EMAIL_TO"
+  register: email_result
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: true
+
+- name: Check email send status
+  debug:
+    msg: |
+      Email Status:
+      Command: {{ email_result.cmd }}
+      Return Code: {{ email_result.rc }}
+      {% if email_result.rc == 0 %}
+      SUCCESS - Email sent to {{ email_recipient }}
+      {% else %}
+      WARNING - Check SMTP configuration
+      Logs available at: /root/.msmtp.log
+      {% endif %}
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Print final confirmation
+  debug:
+    msg: |
+      ╔══════════════════════════════════════════════════════╗
+      ║       EMAIL REPORT CONFIGURATION COMPLETE            ║
+      ╠══════════════════════════════════════════════════════╣
+      ║  Destinataire : {{ email_recipient }}
+      ║  Corps        : HTML (rendu professionnel)           ║
+      ║  Pièce jointe : deployment-summary.txt              ║
+      ║  HTML local   : /tmp/deployment-report.html          ║
+      ║  SMTP Config  : /root/.msmtprc                       ║
+      ║  Mutt Config  : /root/.muttrc                        ║
+      ║  Logs         : /root/.msmtp.log                     ║
+      ╚══════════════════════════════════════════════════════╝
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+

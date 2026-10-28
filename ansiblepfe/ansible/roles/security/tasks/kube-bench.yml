@@ -1,0 +1,36 @@
+---
+- name: Install kube-bench
+  get_url:
+    url: https://github.com/aquasecurity/kube-bench/releases/download/v0.6.11/kube-bench_0.6.11_linux_amd64.tar.gz
+    dest: /tmp/kube-bench.tar.gz
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Extract kube-bench
+  unarchive:
+    src: /tmp/kube-bench.tar.gz
+    dest: /usr/local/bin/
+    remote_src: yes
+    creates: /usr/local/bin/kube-bench
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Run kube-bench
+  command: /usr/local/bin/kube-bench run --config-dir /etc/kube-bench/cfg
+  register: kube_bench_output
+  changed_when: false
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Save kube-bench report
+  copy:
+    content: "{{ kube_bench_output.stdout | default('') }}"
+    dest: "/var/log/kube-bench-report-{{ ansible_date_time.date }}.log"
+    mode: "0644"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+

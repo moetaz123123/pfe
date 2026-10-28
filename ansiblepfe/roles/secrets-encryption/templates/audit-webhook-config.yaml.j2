@@ -1,0 +1,33 @@
+---
+# Audit Webhook Configuration for Secrets
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: audit-webhook-config
+  namespace: kube-system
+data:
+  webhook-config.json: |
+    {
+      "kind": "Config",
+      "apiVersion": "v1",
+      "clusters": [
+        {
+          "name": "audit-webhook",
+          "cluster": {
+            "server": "{{ audit_webhook_url | default('http://localhost:8080/audit') }}"
+          }
+        }
+      ],
+      "contexts": [
+        {
+          "context": {
+            "cluster": "audit-webhook",
+            "user": ""
+          },
+          "name": "default-context"
+        }
+      ],
+      "current-context": "default-context",
+      "preferences": {},
+      "users": []
+    }

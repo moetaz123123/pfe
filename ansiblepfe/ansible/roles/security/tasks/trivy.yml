@@ -1,0 +1,1724 @@
+---
+# ══════════════════════════════════════════════════════════════════════════════
+# Trivy Scan + DefectDojo Integration - COMPLETE FIXED VERSION
+# FIX 1 : force=yes sur tous les copy → le nouveau script est TOUJOURS déployé
+# FIX 2 : réponse POST sauvegardée dans un fichier avant parsing
+# FIX 3 : Valkey healthcheck + restart automatique si gelé (root cause du 500)
+# FIX 4 : suppression engagement_type "CI/CD" qui causait 500
+# FIX 5 : fallback GET utilise ordering=-id (pas o=-id)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Définition des variables par défaut ───────────────────────────────────────
+- name: Set default Trivy version
+  set_fact:
+    trivy_version: "{{ trivy_version | default('0.57.0') }}"
+  run_once: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRIVY INSTALLATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Check if Trivy is already installed
+  command: /usr/local/bin/trivy version
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: trivy_installed
+  changed_when: false
+  failed_when: false
+  ignore_errors: yes
+
+- name: Display Trivy installation status
+  debug:
+    msg: >
+      {% if trivy_installed.rc == 0 %}
+      ✓ Trivy déjà installé ({{ trivy_installed.stdout_lines[0] }})
+      {% else %}
+      ✗ Trivy pas trouvé — téléchargement et installation...
+      {% endif %}
+  run_once: true
+
+- name: Download Trivy binary (if not installed)
+  get_url:
+    url: "https://github.com/aquasecurity/trivy/releases/download/v{{ trivy_version }}/trivy_{{ trivy_version }}_linux-64bit.tar.gz"
+    dest: /tmp/trivy.tar.gz
+    timeout: 300
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: trivy_installed.rc != 0
+  ignore_errors: yes
+
+- name: Extract Trivy binary (if not installed)
+  unarchive:
+    src: /tmp/trivy.tar.gz
+    dest: /usr/local/bin/
+    remote_src: yes
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: trivy_installed.rc != 0
+  ignore_errors: yes
+
+- name: Verify Trivy installation after setup
+  command: /usr/local/bin/trivy version
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: trivy_check
+  changed_when: false
+  ignore_errors: yes
+
+- name: Confirm Trivy is ready
+  debug:
+    msg: "✓ Trivy {{ trivy_check.stdout_lines[0] }} is ready !"
+  run_once: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRIVY DATABASE
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Create Trivy cache directory
+  file:
+    path: "/root/.cache/trivy/db"
+    state: directory
+    mode: "0755"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Check if Trivy DB already exists and is recent (< 24h)
+  shell: |
+    DB_PATH="/root/.cache/trivy/db/metadata.json"
+    if [ -f "$DB_PATH" ]; then
+      MOD_TIME=$(stat -c %Y "$DB_PATH")
+      NOW=$(date +%s)
+      AGE=$((NOW - MOD_TIME))
+      MAX_AGE=$((24 * 3600))
+      if [ $AGE -lt $MAX_AGE ]; then
+        echo "SKIP"
+      else
+        echo "UPDATE"
+      fi
+    else
+      echo "MISSING"
+    fi
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: db_check
+  changed_when: false
+
+- name: Display DB status
+  debug:
+    msg: >
+      {% if db_check.stdout == "SKIP" %}
+      ✓ Trivy DB existe et est récente (< 24h) — SKIP
+      {% elif db_check.stdout == "UPDATE" %}
+      ⚠ Trivy DB existe mais est vieille (> 24h) — UPDATE
+      {% else %}
+      ✗ Trivy DB n'existe pas — INSTALL
+      {% endif %}
+  run_once: true
+
+- name: Download Trivy vulnerability database
+  shell: /usr/local/bin/trivy image --download-db-only
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  timeout: 300
+  changed_when: true
+  when: db_check.stdout != "SKIP"
+  ignore_errors: yes
+
+- name: Download Trivy Java database
+  shell: /usr/local/bin/trivy image --download-java-db-only
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  timeout: 300
+  changed_when: true
+  when: db_check.stdout != "SKIP"
+  ignore_errors: yes
+
+- name: Display DB download completion status
+  debug:
+    msg: >
+      {% if db_check.stdout == "SKIP" %}
+      ✓ Trivy DBs sont à jour — aucun téléchargement nécessaire
+      {% else %}
+      ✓ Trivy DBs téléchargées avec succès
+      {% endif %}
+  run_once: true
+
+- name: Verify Trivy DBs
+  shell: |
+    echo "=== Vuln DB ===" && ls -lh /root/.cache/trivy/db/
+    echo "=== Java DB ===" && ls -lh /root/.cache/trivy/javadb/ 2>/dev/null || echo "Java DB not found"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: trivy_db_verify
+  changed_when: false
+
+- name: Display Trivy DB verification
+  debug:
+    msg: "{{ trivy_db_verify.stdout_lines }}"
+  run_once: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GET CLUSTER IMAGES
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Get all running images in cluster
+  shell: |
+    kubectl get pods -A \
+      -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{range .spec.initContainers[*]}{.image}{"\n"}{end}{end}' \
+      | sort -u | grep -v '^$'
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: cluster_images_raw
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display images found in cluster
+  debug:
+    msg: "Images trouvées : {{ cluster_images_raw.stdout_lines }}"
+  run_once: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRIVY SCAN
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Create Trivy reports directory
+  file:
+    path: /tmp/trivy-reports
+    state: directory
+    mode: "0755"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Scan all cluster images with Trivy
+  shell: |
+    IMAGE="{{ item }}"
+    SAFE_NAME=$(echo "$IMAGE" | tr '/:@' '_')
+    echo "Scanning: $IMAGE"
+    /usr/local/bin/trivy image --severity HIGH,CRITICAL --no-progress \
+      --skip-db-update --skip-java-db-update --offline-scan --scanners vuln \
+      --format table --timeout 5m "$IMAGE" 2>&1 || true
+    /usr/local/bin/trivy image --severity HIGH,CRITICAL --no-progress \
+      --skip-db-update --skip-java-db-update --offline-scan --scanners vuln \
+      --format json --output /tmp/trivy-reports/${SAFE_NAME}.json \
+      --timeout 5m "$IMAGE" 2>/dev/null || true
+    /usr/local/bin/trivy image --severity HIGH,CRITICAL --no-progress \
+      --skip-db-update --skip-java-db-update --offline-scan --scanners vuln \
+      --format sarif --output /tmp/trivy-reports/${SAFE_NAME}.sarif \
+      --timeout 5m "$IMAGE" 2>/dev/null || true
+    echo "--- END: $IMAGE ---"
+  loop: "{{ cluster_images_raw.stdout_lines | default([]) }}"
+  register: trivy_scan_results
+  changed_when: false
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+  when: cluster_images_raw.stdout_lines | default([]) | length > 0
+
+- name: List all generated Trivy reports
+  shell: ls -lh /tmp/trivy-reports/
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: trivy_reports_list
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display list of generated reports
+  debug:
+    msg: "{{ trivy_reports_list.stdout_lines }}"
+  run_once: true
+
+- name: Deploy Trivy report parser script
+  copy:
+    dest: /tmp/trivy_parse.py
+    mode: "0755"
+    force: yes
+    content: |
+      import json, sys
+      json_file = sys.argv[1]
+      with open(json_file) as f:
+          data = json.load(f)
+      results = data.get('Results', [])
+      if not results:
+          print('  No vulnerabilities found.')
+          sys.exit(0)
+      total_critical = 0
+      total_high = 0
+      for r in results:
+          target = r.get('Target', 'unknown')
+          vulns = r.get('Vulnerabilities') or []
+          if not vulns:
+              continue
+          print('\n  Target : ' + target)
+          print('  Vulns  : ' + str(len(vulns)))
+          print('  ' + '-'*60)
+          for v in vulns:
+              sev = v.get('Severity', '?')
+              cve = v.get('VulnerabilityID', '?')
+              pkg = v.get('PkgName', '?')
+              installed = v.get('InstalledVersion', '?')
+              fixed = v.get('FixedVersion', 'No fix available')
+              title = v.get('Title', '')
+              print('  [' + sev + '] ' + cve)
+              print('         Package  : ' + pkg + ' ' + installed)
+              print('         Fixed in : ' + fixed)
+              if title:
+                  print('         Title    : ' + title)
+              if sev == 'CRITICAL':
+                  total_critical += 1
+              elif sev == 'HIGH':
+                  total_high += 1
+      print('')
+      print('  TOTAL CRITICAL : ' + str(total_critical))
+      print('  TOTAL HIGH     : ' + str(total_high))
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Read and display Trivy JSON reports
+  shell: |
+    IMAGE="{{ item }}"
+    SAFE_NAME=$(echo "$IMAGE" | tr '/:@' '_')
+    JSON_FILE="/tmp/trivy-reports/${SAFE_NAME}.json"
+    if [ ! -f "$JSON_FILE" ]; then
+      echo "No report found for: $IMAGE"
+      exit 0
+    fi
+    echo "========================================"
+    echo "Image: $IMAGE"
+    echo "========================================"
+    python3 /tmp/trivy_parse.py "$JSON_FILE" || echo "Could not parse: $JSON_FILE"
+    echo "========================================"
+  loop: "{{ cluster_images_raw.stdout_lines | default([]) }}"
+  register: trivy_report_display
+  changed_when: false
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+  when: cluster_images_raw.stdout_lines | default([]) | length > 0
+
+- name: Display Trivy reports content
+  debug:
+    msg: "{{ item.stdout_lines }}"
+  loop: "{{ trivy_report_display.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  run_once: true
+  when:
+    - trivy_report_display.results | default([]) | length > 0
+    - item.stdout_lines | default([]) | length > 0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STORAGECLASS
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Check if local-path StorageClass exists
+  shell: kubectl get storageclass local-path 2>/dev/null | grep -c local-path || true
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: storageclass_exists
+  changed_when: false
+
+- name: Install local-path-provisioner if needed
+  block:
+    - name: Download local-path manifest
+      get_url:
+        url: https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+        dest: /tmp/local-path-storage.yaml
+      when: storageclass_exists.stdout == "0"
+
+    - name: Apply local-path-provisioner
+      command: kubectl apply -f /tmp/local-path-storage.yaml
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      when: storageclass_exists.stdout == "0"
+
+    - name: Set local-path as default StorageClass
+      shell: |
+        kubectl patch storageclass local-path \
+          -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      when: storageclass_exists.stdout == "0"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEFECTDOJO INSTALLATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Create DefectDojo namespace
+  shell: kubectl create namespace defectdojo --dry-run=client -o yaml | kubectl apply -f -
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Add DefectDojo Helm repository
+  command: helm repo add defectdojo https://raw.githubusercontent.com/DefectDojo/django-DefectDojo/helm-charts
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Update Helm repositories
+  command: helm repo update
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Install/Upgrade DefectDojo
+  command: >
+    helm upgrade --install defectdojo defectdojo/defectdojo
+    --namespace defectdojo
+    --set tag=2.58.2
+    --set imagePullPolicy=IfNotPresent
+    --set django.resources.requests.cpu=250m
+    --set django.resources.requests.memory=600Mi
+    --set django.resources.limits.cpu=2
+    --set django.resources.limits.memory=1500Mi
+    --set django.uwsgi.resources.requests.memory=512Mi
+    --set django.uwsgi.resources.limits.memory=1500Mi
+    --set django.uwsgi.livenessProbe.initialDelaySeconds=300
+    --set django.uwsgi.livenessProbe.failureThreshold=25
+    --set django.uwsgi.livenessProbe.timeoutSeconds=10
+    --set django.uwsgi.livenessProbe.periodSeconds=12
+    --set django.nginx.resources.requests.memory=128Mi
+    --set django.nginx.resources.limits.memory=256Mi
+    --set django.nginx.startupProbe.failureThreshold=60
+    --set django.nginx.startupProbe.periodSeconds=10
+    --set django.nginx.startupProbe.timeoutSeconds=10
+    --set django.nginx.readinessProbe.failureThreshold=10
+    --set django.nginx.readinessProbe.timeoutSeconds=10
+    --set django.nginx.readinessProbe.periodSeconds=10
+    --set django.nginx.livenessProbe.failureThreshold=10
+    --set django.nginx.livenessProbe.timeoutSeconds=10
+    --set "django.env.DD_SESSION_COOKIE_SECURE=False"
+    --set "django.env.DD_CSRF_COOKIE_SECURE=False"
+    --set celery.worker.replicas=1
+    --set celery.worker.resources.requests.memory=256Mi
+    --set celery.worker.resources.limits.memory=1Gi
+    --set valkey.resources.requests.memory=128Mi
+    --set valkey.resources.limits.memory=512Mi
+    --set postgresql.resources.requests.memory=256Mi
+    --set postgresql.resources.limits.memory=1Gi
+    --set createSecret=false
+    --set createPostgresqlSecret=false
+    --set createValkeySecret=false
+    --set django.ingress.enabled=false
+    --set django.serviceType=ClusterIP
+    --timeout=35m
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+# ══════════════════════════════════════════════════════════════════════════════
+# DEFECTDOJO - HAUTE DISPONIBILITÉ (anti-affinité + réplication)
+# Objectif : si worker-02 tombe, les pods migrent sur worker-01 automatiquement
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Check number of available worker nodes
+  shell: |
+    kubectl get nodes --no-headers \
+      | grep -v master | grep -v control-plane \
+      | grep -c " Ready" || true
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: worker_count
+  changed_when: false
+
+- name: Display worker count
+  debug:
+    msg: "Workers disponibles : {{ worker_count.stdout | trim }}"
+  run_once: true
+
+- name: Scale Django to 2 replicas with anti-affinity
+  shell: |
+    # Scale deployment
+    kubectl scale deployment defectdojo-django \
+      --replicas=2 -n defectdojo
+
+    # Patch podAntiAffinity pour forcer les replicas sur des nœuds différents
+    kubectl patch deployment defectdojo-django -n defectdojo \
+      --type=merge -p '{
+        "spec": {
+          "template": {
+            "spec": {
+              "affinity": {
+                "podAntiAffinity": {
+                  "preferredDuringSchedulingIgnoredDuringExecution": [{
+                    "weight": 100,
+                    "podAffinityTerm": {
+                      "labelSelector": {
+                        "matchExpressions": [{
+                          "key": "app.kubernetes.io/name",
+                          "operator": "In",
+                          "values": ["defectdojo"]
+                        }]
+                      },
+                      "topologyKey": "kubernetes.io/hostname"
+                    }
+                  }]
+                }
+              }
+            }
+          }
+        }
+      }'
+    echo "Django scaled and anti-affinity patched"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: worker_count.stdout | trim | int >= 2
+  ignore_errors: yes
+
+- name: Scale Celery worker to 2 replicas with anti-affinity
+  shell: |
+    kubectl scale deployment defectdojo-celery-worker \
+      --replicas=2 -n defectdojo
+
+    kubectl patch deployment defectdojo-celery-worker -n defectdojo \
+      --type=merge -p '{
+        "spec": {
+          "template": {
+            "spec": {
+              "affinity": {
+                "podAntiAffinity": {
+                  "preferredDuringSchedulingIgnoredDuringExecution": [{
+                    "weight": 100,
+                    "podAffinityTerm": {
+                      "labelSelector": {
+                        "matchExpressions": [{
+                          "key": "app.kubernetes.io/name",
+                          "operator": "In",
+                          "values": ["defectdojo"]
+                        }]
+                      },
+                      "topologyKey": "kubernetes.io/hostname"
+                    }
+                  }]
+                }
+              }
+            }
+          }
+        }
+      }'
+    echo "Celery worker scaled and anti-affinity patched"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: worker_count.stdout | trim | int >= 2
+  ignore_errors: yes
+
+- name: Configure PodDisruptionBudgets (PDB)
+  shell: |
+    # Django PDB : toujours au moins 1 pod disponible
+    cat <<EOF | kubectl apply -f -
+    apiVersion: policy/v1
+    kind: PodDisruptionBudget
+    metadata:
+      name: defectdojo-django-pdb
+      namespace: defectdojo
+    spec:
+      minAvailable: 1
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: defectdojo
+          defectdojo.org/component: django
+    EOF
+
+    # Celery worker PDB
+    cat <<EOF | kubectl apply -f -
+    apiVersion: policy/v1
+    kind: PodDisruptionBudget
+    metadata:
+      name: defectdojo-celery-pdb
+      namespace: defectdojo
+    spec:
+      minAvailable: 1
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: defectdojo
+          defectdojo.org/component: worker
+    EOF
+    echo "PDBs created"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POSTGRESQL - Pas de migration possible avec local-path provisioner
+# Le PVC est lié au node où il a été créé (worker-02)
+# Solution : PodDisruptionBudget + monitoring uniquement
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Check current PostgreSQL node
+  shell: |
+    kubectl get pod defectdojo-postgresql-0 -n defectdojo \
+      -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "unknown"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: pg_current_node
+  changed_when: false
+  ignore_errors: yes
+
+- name: Check PostgreSQL PVC binding node
+  shell: |
+    PVC=$(kubectl get pvc -n defectdojo \
+      -l app.kubernetes.io/name=postgresql \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [ -z "$PVC" ]; then
+      PVC=$(kubectl get pvc -n defectdojo --no-headers \
+        | grep postgres | awk '{print $1}' | head -1)
+    fi
+    echo "PVC: $PVC"
+    PV=$(kubectl get pvc "$PVC" -n defectdojo \
+      -o jsonpath='{.spec.volumeName}' 2>/dev/null)
+    echo "PV: $PV"
+    NODE=$(kubectl get pv "$PV" \
+      -o jsonpath='{.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}' \
+      2>/dev/null || echo "unknown")
+    echo "Bound to node: $NODE"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: pg_pvc_info
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display PostgreSQL storage info
+  debug:
+    msg:
+      - "{{ pg_pvc_info.stdout_lines }}"
+      - "⚠ local-path PVC = PostgreSQL ne peut PAS migrer de node"
+      - "PostgreSQL est définitivement lié à : {{ pg_current_node.stdout | trim }}"
+  run_once: true
+
+- name: Ensure PostgreSQL StatefulSet has NO nodeSelector (local-path constraint)
+  shell: |
+    HAS_SELECTOR=$(kubectl get statefulset defectdojo-postgresql -n defectdojo \
+      -o jsonpath='{.spec.template.spec.nodeSelector}' 2>/dev/null)
+    echo "Current nodeSelector: $HAS_SELECTOR"
+    if [ -n "$HAS_SELECTOR" ] && [ "$HAS_SELECTOR" != "{}" ] && [ "$HAS_SELECTOR" != "null" ]; then
+      echo "→ Suppression du nodeSelector (incompatible avec local-path)..."
+      kubectl patch statefulset defectdojo-postgresql -n defectdojo \
+        --type=json -p '[
+          {"op": "remove", "path": "/spec/template/spec/nodeSelector"}
+        ]' 2>/dev/null || true
+      kubectl patch statefulset defectdojo-postgresql -n defectdojo \
+        --type=json -p '[
+          {"op": "remove", "path": "/spec/template/spec/tolerations"}
+        ]' 2>/dev/null || true
+      echo "✓ nodeSelector supprimé"
+      # Forcer le reschedule si pod Pending
+      STATUS=$(kubectl get pod defectdojo-postgresql-0 -n defectdojo \
+        -o jsonpath='{.status.phase}' 2>/dev/null)
+      if [ "$STATUS" = "Pending" ]; then
+        echo "→ Pod Pending détecté — suppression pour reschedule..."
+        kubectl delete pod defectdojo-postgresql-0 -n defectdojo --grace-period=0
+        echo "✓ Pod supprimé — reschedule en cours"
+      fi
+    else
+      echo "✓ Pas de nodeSelector — rien à faire"
+    fi
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Wait for PostgreSQL to be Running again
+  shell: |
+    echo "⏳ Attente PostgreSQL Running..."
+    for i in $(seq 1 40); do
+      STATUS=$(kubectl get pod defectdojo-postgresql-0 -n defectdojo \
+        -o jsonpath='{.status.phase}' 2>/dev/null)
+      READY=$(kubectl get pod defectdojo-postgresql-0 -n defectdojo \
+        -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+      echo "  Attempt $i - Status: $STATUS | Ready: $READY"
+      if [ "$STATUS" = "Running" ] && [ "$READY" = "true" ]; then
+        echo "✓ PostgreSQL opérationnel"
+        exit 0
+      fi
+      sleep 5
+    done
+    echo "⚠ Timeout PostgreSQL (non bloquant)"
+    exit 0
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: pg_recovery_wait
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display PostgreSQL recovery status
+  debug:
+    msg: "{{ pg_recovery_wait.stdout_lines }}"
+  run_once: true
+
+- name: Configure PostgreSQL PodDisruptionBudget
+  shell: |
+    cat <<EOF | kubectl apply -f -
+    apiVersion: policy/v1
+    kind: PodDisruptionBudget
+    metadata:
+      name: defectdojo-postgresql-pdb
+      namespace: defectdojo
+    spec:
+      minAvailable: 1
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: postgresql
+    EOF
+    echo "✓ PostgreSQL PDB configuré"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Display PostgreSQL HA limitation summary
+  debug:
+    msg:
+      - "╔══════════════════════════════════════════════════╗"
+      - "║         PostgreSQL - Résumé contraintes          ║"
+      - "╚══════════════════════════════════════════════════╝"
+      - "Provisioner : local-path (PVC lié au node physique)"
+      - "Node actuel : {{ pg_current_node.stdout | trim }}"
+      - "Migration   : IMPOSSIBLE sans migration manuelle du PVC"
+      - "Protection  : PodDisruptionBudget minAvailable=1 ✓"
+      - "----------------------------------------------------"
+      - "Pour une vraie HA PostgreSQL :"
+      - "  Option 1 → Migrer vers NFS/Ceph/Longhorn (PVC partagé)"
+      - "  Option 2 → CloudNativePG avec réplication streaming"
+      - "  Option 3 → Sauvegardes régulières du PVC (pg_dump cron)"
+
+- name: Verify pod distribution across nodes
+  shell: |
+    echo "=== Distribution des pods DefectDojo ==="
+    kubectl get pods -n defectdojo -o wide --no-headers \
+      | awk '{print $7, $1, $3}' | sort
+    echo ""
+    echo "=== Résumé par nœud ==="
+    kubectl get pods -n defectdojo -o wide --no-headers \
+      | awk '{print $7}' | sort | uniq -c | sort -rn
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: pod_distribution
+  changed_when: false
+
+- name: Display pod distribution
+  debug:
+    msg: "{{ pod_distribution.stdout_lines }}"
+  run_once: true
+
+- name: Simulate failover test (dry-run)
+  shell: |
+    echo "=== Test de résilience (simulation) ==="
+    echo ""
+    echo "Commande pour simuler la panne de worker-02 :"
+    echo "  kubectl cordon worker-02"
+    echo "  kubectl drain worker-02 --ignore-daemonsets --delete-emptydir-data --force"
+    echo ""
+    echo "Les pods migreront automatiquement sur worker-01"
+    echo ""
+    echo "Pour revenir à la normale :"
+    echo "  kubectl uncordon worker-02"
+    echo ""
+    DJANGO_NODES=$(kubectl get pods -n defectdojo -l "defectdojo.org/component=django" \
+      -o wide --no-headers 2>/dev/null | awk '{print $7}' | sort -u | tr '\n' ', ')
+    echo "Django actuellement sur : $DJANGO_NODES"
+
+    CELERY_NODES=$(kubectl get pods -n defectdojo -l "defectdojo.org/component=worker" \
+      -o wide --no-headers 2>/dev/null | awk '{print $7}' | sort -u | tr '\n' ', ')
+    echo "Celery actuellement sur : $CELERY_NODES"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: failover_info
+  changed_when: false
+
+- name: Display failover information
+  debug:
+    msg: "{{ failover_info.stdout_lines }}"
+  run_once: true
+
+- name: Wait for PostgreSQL to accept connections
+  shell: |
+    echo "→ Vérification PostgreSQL..."
+    PG_POD=$(kubectl get pod -n defectdojo -l app.kubernetes.io/name=postgresql \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [ -z "$PG_POD" ]; then
+      echo "⚠ Pod PostgreSQL non trouvé (non bloquant)"
+      exit 0
+    fi
+    for i in $(seq 1 30); do
+      PG_RESPONSE=$(kubectl exec -n defectdojo $PG_POD -- \
+        pg_isready -U postgres 2>/dev/null || echo "no")
+      echo "  Attempt $i - PostgreSQL: $PG_RESPONSE"
+      if echo "$PG_RESPONSE" | grep -q "accepting"; then
+        echo "✓ PostgreSQL accepte les connexions"
+        exit 0
+      fi
+      sleep 3
+    done
+    echo "⚠ PostgreSQL timeout (non bloquant)"
+    exit 0
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Wait for Celery worker to be ready
+  shell: |
+    echo "→ Attente Celery worker..."
+    CELERY_POD=""
+    for i in $(seq 1 10); do
+      CELERY_POD=$(kubectl get pods -n defectdojo --no-headers 2>/dev/null \
+        | grep -i celery | head -1 | awk '{print $1}')
+      if [ -n "$CELERY_POD" ]; then
+        echo "  ✓ Pod Celery trouvé: $CELERY_POD"
+        break
+      fi
+      echo "  Attempt $i - Pod Celery non trouvé, attente..."
+      sleep 3
+    done
+    if [ -z "$CELERY_POD" ]; then
+      echo "⚠ Aucun pod Celery trouvé (non bloquant)"
+      kubectl get pods -n defectdojo --no-headers 2>/dev/null | head -10
+      exit 0
+    fi
+    for i in $(seq 1 30); do
+      WORKER_READY=$(kubectl get pod -n defectdojo $CELERY_POD \
+        -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+      echo "  Attempt $i - Celery ($CELERY_POD) ready: $WORKER_READY"
+      [ "$WORKER_READY" = "true" ] && exit 0
+      sleep 5
+    done
+    echo "⚠ Celery worker not ready after 5 minutes (non bloquant)"
+    exit 0
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Wait for Valkey (Redis) to be ready
+  shell: |
+    echo "→ Attente Valkey/Redis..."
+    VALKEY_POD=""
+    for i in $(seq 1 10); do
+      VALKEY_POD=$(kubectl get pods -n defectdojo --no-headers 2>/dev/null \
+        | grep -iE "valkey|redis" | head -1 | awk '{print $1}')
+      if [ -n "$VALKEY_POD" ]; then
+        echo "  ✓ Pod Valkey/Redis trouvé: $VALKEY_POD"
+        break
+      fi
+      echo "  Attempt $i - Pod Valkey/Redis non trouvé, attente..."
+      sleep 3
+    done
+    if [ -z "$VALKEY_POD" ]; then
+      echo "⚠ Aucun pod Valkey/Redis trouvé (non bloquant)"
+      exit 0
+    fi
+    for i in $(seq 1 30); do
+      VALKEY_READY=$(kubectl get pod -n defectdojo $VALKEY_POD \
+        -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+      echo "  Attempt $i - Valkey ($VALKEY_POD) ready: $VALKEY_READY"
+      [ "$VALKEY_READY" = "true" ] && exit 0
+      sleep 5
+    done
+    echo "⚠ Valkey/Redis not ready after 5 minutes (non bloquant)"
+    exit 0
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Wait for DefectDojo initializer to complete
+  shell: |
+    echo "→ Attente initializer DefectDojo..."
+    for i in $(seq 1 30); do
+      STATUS=$(kubectl get pods -n defectdojo --no-headers 2>/dev/null \
+        | grep initializer | awk '{print $3}' | head -1)
+      echo "Attempt $i/30 - Initializer status: $STATUS"
+      if [ "$STATUS" = "Completed" ]; then
+        echo "✓ Initializer completed successfully"
+        exit 0
+      fi
+      if [ "$STATUS" = "Error" ] || [ "$STATUS" = "CrashLoopBackOff" ]; then
+        echo "⚠ Initializer failed: $STATUS (non bloquant)"
+        exit 0
+      fi
+      sleep 5
+    done
+    echo "⚠ Timeout initializer (non bloquant)"
+    exit 0
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: initializer_wait
+  changed_when: false
+  ignore_errors: yes
+
+- name: Wait for DefectDojo django deployment rollout
+  command: kubectl rollout status deployment/defectdojo-django --namespace defectdojo --timeout=600s
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  retries: 5
+  delay: 30
+  register: rollout_status
+  until: rollout_status.rc == 0
+  ignore_errors: yes
+
+- name: Show DefectDojo pods status
+  command: kubectl get pods -n defectdojo -o wide
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: dojo_pods
+
+- name: Display DefectDojo pods
+  debug:
+    msg: "{{ dojo_pods.stdout_lines }}"
+  run_once: true
+
+- name: Wait for django pod to be fully ready (2/2)
+  shell: |
+    for i in $(seq 1 30); do
+      READY=$(kubectl get pods -n defectdojo --no-headers 2>/dev/null \
+        | grep django | grep Running | awk '{print $2}' | grep -c "2/2" || true)
+      echo "Attempt $i - Ready 2/2 pods: $READY"
+      if [ "$READY" -ge 1 ]; then
+        echo "Django pod is fully ready (2/2 containers running)"
+        exit 0
+      fi
+      sleep 10
+    done
+    echo "⚠ Timeout: django pod not fully ready after 10min (non bloquant)"
+    exit 0
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: django_ready_wait
+  changed_when: false
+  ignore_errors: yes
+
+- name: Wait for Django API to actually respond
+  shell: |
+    echo "Waiting for Django API to respond..."
+    DJANGO_POD=$(kubectl get pod -n defectdojo \
+      -l "app.kubernetes.io/name=defectdojo,defectdojo.org/component=django" \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [ -z "$DJANGO_POD" ]; then
+      echo "WARNING: Django pod not found"
+      exit 0
+    fi
+    for i in $(seq 1 30); do
+      HTTP_CODE=$(kubectl exec -n defectdojo $DJANGO_POD -c uwsgi -- \
+        curl -s -o /dev/null -w '%{http_code}' \
+        http://localhost:8000/api/v2/users/ 2>/dev/null || echo "000")
+      echo "  Attempt $i - Django API HTTP: $HTTP_CODE"
+      if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then
+        echo "OK: Django API responding (HTTP $HTTP_CODE)"
+        exit 0
+      fi
+      sleep 3
+    done
+    echo "WARNING: Django API did not respond after 6 minutes (non-blocking)"
+    exit 0
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Display django readiness result
+  debug:
+    msg: "{{ django_ready_wait.stdout_lines }}"
+  run_once: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEFECTDOJO - SECRETS & TOKEN
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Get DefectDojo admin password
+  shell: |
+    kubectl get secret defectdojo -n defectdojo \
+      -o jsonpath='{.data.DD_ADMIN_PASSWORD}' 2>/dev/null \
+      | base64 --decode 2>/dev/null || echo "PASSWORD_NOT_FOUND"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: dojo_admin_password
+  changed_when: false
+
+- name: Get PostgreSQL password from secret
+  shell: |
+    kubectl get secret defectdojo-postgresql-specific -n defectdojo \
+      -o jsonpath='{.data.postgresql-password}' | base64 --decode
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: dojo_pg_password
+  changed_when: false
+  ignore_errors: yes
+
+- name: Get API Token via PostgreSQL
+  shell: |
+    PGPASS="{{ dojo_pg_password.stdout | default('') | trim }}"
+    kubectl exec -n defectdojo defectdojo-postgresql-0 -- \
+      env PGPASSWORD="$PGPASS" psql -U defectdojo -d defectdojo -t -A -c \
+      "SELECT at.key FROM authtoken_token at
+       JOIN auth_user u ON at.user_id = u.id
+       WHERE u.username = 'admin' LIMIT 1;" \
+      2>/dev/null | tr -d ' \n\r' || true
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: dojo_token_psql
+  changed_when: false
+  ignore_errors: yes
+
+- name: Set API token fact
+  set_fact:
+    dojo_token_final: "{{ dojo_token_psql.stdout | default('') | trim }}"
+
+- name: Display token status
+  debug:
+    msg: "Token: {{ 'OK - ' + dojo_token_final[:8] + '...' if dojo_token_final != '' else 'ECHEC - token vide' }}"
+  run_once: true
+
+- name: Get Django pod name (2/2 Running)
+  shell: |
+    kubectl get pod -n defectdojo --no-headers \
+      | grep django | grep Running | grep "2/2" | awk '{print $1}' | head -1
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: django_pod_name
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display django pod name
+  debug:
+    msg: "Django pod: {{ django_pod_name.stdout | trim }}"
+  run_once: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEFECTDOJO - PRODUCT
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Deploy product creation script
+  copy:
+    dest: /tmp/dojo_product.sh
+    mode: "0755"
+    force: yes
+    content: |
+      #!/bin/sh
+      TOKEN="$1"
+      POD="$2"
+      PORT=18081
+      export KUBECONFIG=/home/ubuntu/.kube/config
+
+      log() { echo "[dojo_product] $*" >&2; }
+      cleanup() { kill "$PF_PID" 2>/dev/null || true; sleep 1; }
+
+      pkill -f "port-forward.*${PORT}" 2>/dev/null || true
+      sleep 2
+
+      kubectl port-forward "pod/${POD}" "${PORT}:8081" -n defectdojo >/dev/null 2>&1 &
+      PF_PID=$!
+      trap cleanup EXIT
+      log "Port-forward started PID=$PF_PID"
+
+      READY=0
+      for i in $(seq 1 30); do
+        sleep 3
+        HTTP=$(curl -sf --connect-timeout 5 -o /dev/null -w "%{http_code}" \
+          -H "Authorization: Token $TOKEN" \
+          "http://localhost:${PORT}/api/v2/users/" 2>/dev/null || echo "000")
+        log "  Attempt $i - HTTP $HTTP"
+        if [ "$HTTP" = "200" ]; then READY=1; break; fi
+      done
+      [ "$READY" = "0" ] && log "WARNING: API not ready — trying anyway"
+
+      curl -s --connect-timeout 10 \
+        -X POST "http://localhost:${PORT}/api/v2/products/" \
+        -H "Authorization: Token $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{"name":"Kubernetes Cluster Security","description":"Vulnerability scans with Trivy","prod_type":1}' \
+        -o /tmp/dojo_product_resp.json 2>/dev/null
+
+      log "POST response: $(cat /tmp/dojo_product_resp.json)"
+
+      PRODUCT_ID=$(python3 -c "
+      import json
+      try:
+          d = json.load(open('/tmp/dojo_product_resp.json'))
+          pid = d.get('id', '')
+          if pid: print(str(pid))
+      except Exception as e:
+          import sys; print('ERROR: ' + str(e), file=sys.stderr)
+      " 2>/dev/null || true)
+
+      if [ -z "$PRODUCT_ID" ]; then
+        log "POST failed — GET by name"
+        curl -s --connect-timeout 10 \
+          "http://localhost:${PORT}/api/v2/products/?name=Kubernetes+Cluster+Security" \
+          -H "Authorization: Token $TOKEN" \
+          -o /tmp/dojo_product_fallback.json 2>/dev/null
+        PRODUCT_ID=$(python3 -c "
+      import json
+      try:
+          d = json.load(open('/tmp/dojo_product_fallback.json'))
+          r = d.get('results', [])
+          if r: print(str(r[0]['id']))
+      except Exception as e:
+          import sys; print('ERROR: ' + str(e), file=sys.stderr)
+      " 2>/dev/null || true)
+      fi
+
+      if [ -z "$PRODUCT_ID" ]; then
+        log "CRITICAL: Could not create or find product"
+        echo ""; exit 1
+      fi
+      log "SUCCESS: Product ID = $PRODUCT_ID"
+      echo "$PRODUCT_ID"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: dojo_token_final != ''
+
+- name: Create DefectDojo Product
+  command: >
+    /tmp/dojo_product.sh
+    {{ dojo_token_final }}
+    {{ django_pod_name.stdout | trim }}
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: dojo_product_result
+  changed_when: false
+  ignore_errors: yes
+  when:
+    - dojo_token_final != ''
+    - django_pod_name.stdout | trim != ''
+
+- name: Debug product script output
+  debug:
+    msg:
+      - "STDOUT : {{ dojo_product_result.stdout | default('(empty)') }}"
+      - "STDERR : {{ dojo_product_result.stderr | default('(empty)') }}"
+  run_once: true
+  when: dojo_product_result is defined
+
+- name: Set product ID
+  set_fact:
+    dojo_product_id: >-
+      {{ dojo_product_result.stdout_lines
+         | default([])
+         | select('match', '^[0-9]+$')
+         | list | last | default('') }}
+  when: dojo_token_final != ''
+
+- name: Set default product ID if empty
+  set_fact:
+    dojo_product_id: "1"
+  when: dojo_token_final == '' or dojo_product_id | default('') == ''
+
+- name: Display product status
+  debug:
+    msg: "Product ID: {{ dojo_product_id }}"
+  run_once: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEFECTDOJO - VALKEY HEALTHCHECK + RESTART AUTOMATIQUE SI GELÉ
+# FIX ROOT CAUSE : Valkey gelé → POST /api/v2/engagements/ retourne 500
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Check Valkey is responding
+  shell: |
+    kubectl exec -n defectdojo defectdojo-valkey-0 -- \
+      valkey-cli ping 2>/dev/null | grep -c PONG || echo "0"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: valkey_ping
+  changed_when: false
+  ignore_errors: yes
+
+- name: Restart Valkey if not responding
+  shell: |
+    echo "⚠ Valkey ne répond pas — restart..."
+    kubectl rollout restart statefulset/defectdojo-valkey -n defectdojo
+    echo "⏳ Attente redémarrage Valkey..."
+    kubectl rollout status statefulset/defectdojo-valkey -n defectdojo --timeout=120s
+    echo "✓ Valkey redémarré"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: valkey_ping.stdout | trim == "0"
+  ignore_errors: yes
+
+- name: Wait for Valkey to accept connections after restart
+  shell: |
+    for i in $(seq 1 20); do
+      PONG=$(kubectl exec -n defectdojo defectdojo-valkey-0 -- \
+        valkey-cli ping 2>/dev/null || echo "")
+      echo "  Attempt $i - Valkey: $PONG"
+      if [ "$PONG" = "PONG" ]; then
+        echo "✓ Valkey opérationnel"
+        exit 0
+      fi
+      sleep 5
+    done
+    echo "⚠ Valkey timeout (non bloquant)"
+    exit 0
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: valkey_ping.stdout | trim == "0"
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display Valkey status
+  debug:
+    msg: "{{ '✓ Valkey OK — pas de restart nécessaire' if valkey_ping.stdout | trim == '1' else '⚠ Valkey redémarré — OK maintenant' }}"
+  run_once: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEFECTDOJO - ENGAGEMENT
+# FIX 1 : Valkey healthcheck avant création (voir section ci-dessus)
+# FIX 2 : suppression engagement_type "CI/CD" → causait Internal Server Error 500
+# FIX 3 : fallback GET utilise ordering=-id (pas o=-id)
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Set engagement name (fixed date, new ID each run)
+  set_fact:
+    dojo_engagement_name: "Trivy Scan {{ ansible_date_time.date }}"
+  run_once: true
+
+- name: Display engagement name to be created
+  debug:
+    msg: "Engagement name: {{ dojo_engagement_name }}"
+  run_once: true
+
+- name: Deploy engagement creation script
+  copy:
+    dest: /tmp/dojo_engagement.sh
+    mode: "0755"
+    force: yes
+    content: |
+      #!/bin/sh
+      # ============================================================
+      # dojo_engagement.sh - FIXED
+      # FIX 1: suppression engagement_type "CI/CD" → causait 500
+      # FIX 2: fallback GET utilise ordering=-id (pas o=-id)
+      # FIX 3: curl -o fichier puis python3 fichier (pas de pipe)
+      # Args: $1=TOKEN  $2=PRODUCT_ID  $3=SCAN_DATE  $4=POD  $5=ENGAGEMENT_NAME
+      # ============================================================
+      TOKEN="$1"
+      PRODUCT_ID="$2"
+      SCAN_DATE="$3"
+      POD="$4"
+      ENGAGEMENT_NAME="$5"
+      PORT=18082
+      export KUBECONFIG=/home/ubuntu/.kube/config
+
+      log() { echo "[dojo_engagement] $*" >&2; }
+      cleanup() { log "Cleanup PID=$PF_PID"; kill "$PF_PID" 2>/dev/null || true; sleep 1; }
+
+      pkill -f "port-forward.*${PORT}" 2>/dev/null || true
+      sleep 2
+
+      kubectl port-forward "pod/${POD}" "${PORT}:8081" -n defectdojo >/dev/null 2>&1 &
+      PF_PID=$!
+      trap cleanup EXIT
+      log "Port-forward started PID=$PF_PID on port $PORT"
+
+      READY=0
+      for i in $(seq 1 30); do
+        sleep 3
+        HTTP=$(curl -sf --connect-timeout 5 -o /dev/null -w "%{http_code}" \
+          -H "Authorization: Token $TOKEN" \
+          "http://localhost:${PORT}/api/v2/users/" 2>/dev/null || echo "000")
+        log "  Attempt $i - HTTP $HTTP"
+        if [ "$HTTP" = "200" ]; then READY=1; break; fi
+      done
+      [ "$READY" = "0" ] && log "WARNING: API not ready after 90s — trying anyway"
+
+      log "POSTing new engagement: '$ENGAGEMENT_NAME' (product=$PRODUCT_ID)"
+      curl -s --connect-timeout 10 \
+        -X POST "http://localhost:${PORT}/api/v2/engagements/" \
+        -H "Authorization: Token $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"name\": \"${ENGAGEMENT_NAME}\",
+          \"product\": ${PRODUCT_ID},
+          \"target_start\": \"${SCAN_DATE}\",
+          \"target_end\": \"${SCAN_DATE}\",
+          \"status\": \"In Progress\",
+          \"deduplication_on_engagement\": false
+        }" \
+        -o /tmp/dojo_eng_resp.json 2>/dev/null
+
+      log "POST response: $(cat /tmp/dojo_eng_resp.json)"
+
+      ENG_ID=$(python3 -c "
+      import json, sys
+      try:
+          d = json.load(open('/tmp/dojo_eng_resp.json'))
+          eid = d.get('id', '')
+          if eid:
+              print(str(eid))
+          else:
+              print('POST_FAILED: ' + json.dumps(d), file=sys.stderr)
+      except Exception as e:
+          print('PARSE_ERROR: ' + str(e), file=sys.stderr)
+      " 2>/dev/null || true)
+
+      log "ENG_ID after POST: '$ENG_ID'"
+
+      if [ -z "$ENG_ID" ]; then
+        log "POST returned no ID — fallback GET last engagement of product $PRODUCT_ID"
+        curl -s --connect-timeout 10 \
+          "http://localhost:${PORT}/api/v2/engagements/?product=${PRODUCT_ID}&limit=200&ordering=-id" \
+          -H "Authorization: Token $TOKEN" \
+          -o /tmp/dojo_eng_fallback.json 2>/dev/null
+
+        log "GET fallback: $(cat /tmp/dojo_eng_fallback.json)"
+
+        ENG_ID=$(python3 -c "
+      import json, sys
+      try:
+          d = json.load(open('/tmp/dojo_eng_fallback.json'))
+          results = d.get('results', [])
+          if results:
+              print(str(results[0]['id']))
+          else:
+              print('FALLBACK_EMPTY', file=sys.stderr)
+      except Exception as e:
+          print('FALLBACK_ERROR: ' + str(e), file=sys.stderr)
+      " 2>/dev/null || true)
+
+        log "ENG_ID after fallback GET: '$ENG_ID'"
+      fi
+
+      if [ -z "$ENG_ID" ]; then
+        log "CRITICAL: Could not create or retrieve engagement"
+        echo ""; exit 1
+      fi
+
+      log "SUCCESS: Engagement ID = $ENG_ID"
+      echo "$ENG_ID"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: dojo_token_final != ''
+
+- name: Create DefectDojo Engagement
+  command: >
+    /tmp/dojo_engagement.sh
+    {{ dojo_token_final }}
+    {{ dojo_product_id }}
+    {{ ansible_date_time.date }}
+    {{ django_pod_name.stdout | trim }}
+    "{{ dojo_engagement_name }}"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: dojo_engagement_result
+  changed_when: false
+  ignore_errors: yes
+  when:
+    - dojo_token_final != ''
+    - django_pod_name.stdout | trim != ''
+
+- name: Debug engagement script output
+  debug:
+    msg:
+      - "STDOUT : {{ dojo_engagement_result.stdout | default('(empty)') }}"
+      - "STDERR : {{ dojo_engagement_result.stderr | default('(empty)') }}"
+      - "RC     : {{ dojo_engagement_result.rc | default('N/A') }}"
+  run_once: true
+  when: dojo_engagement_result is defined
+
+- name: Set engagement ID from result
+  set_fact:
+    dojo_engagement_id: >-
+      {{ dojo_engagement_result.stdout_lines
+         | default([])
+         | select('match', '^[0-9]+$')
+         | list | last | default('') }}
+  when: dojo_token_final != ''
+
+- name: Set default engagement ID if still empty
+  set_fact:
+    dojo_engagement_id: "1"
+  when: >
+    dojo_token_final == ''
+    or dojo_engagement_id | default('') == ''
+
+- name: Display final engagement status
+  debug:
+    msg:
+      - "Engagement Name : {{ dojo_engagement_name | default('N/A') }}"
+      - "Engagement ID   : {{ dojo_engagement_id }}"
+  run_once: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEFECTDOJO - IMPORT TRIVY REPORTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Deploy import script
+  copy:
+    dest: /tmp/dojo_import.sh
+    mode: "0755"
+    force: yes
+    content: |
+      #!/bin/sh
+      TOKEN="$1"
+      ENGAGEMENT_ID="$2"
+      JSON_FILE="$3"
+      IMAGE="$4"
+      POD="$5"
+      PORT=18091
+      export KUBECONFIG=/home/ubuntu/.kube/config
+
+      log() { echo "[dojo_import] $*" >&2; }
+
+      if [ ! -f "$JSON_FILE" ]; then
+        echo "SKIP: no file $JSON_FILE"
+        exit 0
+      fi
+
+      cleanup() { kill "$PF_PID" 2>/dev/null || true; sleep 1; }
+
+      pkill -f "port-forward.*${PORT}" 2>/dev/null || true
+      sleep 1
+
+      kubectl port-forward "pod/${POD}" "${PORT}:8081" -n defectdojo >/dev/null 2>&1 &
+      PF_PID=$!
+      trap cleanup EXIT
+      log "Port-forward started PID=$PF_PID"
+
+      READY=0
+      for i in $(seq 1 30); do
+        sleep 3
+        HTTP=$(curl -sf --connect-timeout 5 -o /dev/null -w "%{http_code}" \
+          -H "Authorization: Token $TOKEN" \
+          "http://localhost:${PORT}/api/v2/users/" 2>/dev/null || echo "000")
+        log "  Attempt $i - HTTP $HTTP"
+        if [ "$HTTP" = "200" ]; then READY=1; break; fi
+      done
+      [ "$READY" = "0" ] && log "WARNING: API not ready — trying anyway"
+
+      log "Importing: $IMAGE (engagement=$ENGAGEMENT_ID)"
+      curl -s --connect-timeout 30 \
+        -X POST "http://localhost:${PORT}/api/v2/import-scan/" \
+        -H "Authorization: Token $TOKEN" \
+        -F "scan_type=Trivy Scan" \
+        -F "engagement=$ENGAGEMENT_ID" \
+        -F "file=@${JSON_FILE}" \
+        -F "active=true" \
+        -F "verified=false" \
+        -F "minimum_severity=High" \
+        -o /tmp/import_out.json 2>/dev/null
+
+      python3 -c "
+      import json
+      try:
+          d = json.load(open('/tmp/import_out.json'))
+          s = d.get('statistics', {}).get('after', {})
+          test_id = d.get('test_id', '?')
+          critical = s.get('critical', {}).get('total', 0)
+          high = s.get('high', {}).get('total', 0)
+          print('OK test_id:' + str(test_id) + ' CRITICAL:' + str(critical) + ' HIGH:' + str(high))
+      except Exception as e:
+          print('Import done (parse error): ' + str(e))
+      " 2>/dev/null || echo "Import done: $IMAGE"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: dojo_token_final != ''
+
+- name: Import Trivy JSON reports into DefectDojo
+  command: >
+    /tmp/dojo_import.sh
+    {{ dojo_token_final }}
+    {{ dojo_engagement_id }}
+    /tmp/trivy-reports/{{ item | regex_replace('[/:@]', '_') }}.json
+    {{ item }}
+    {{ django_pod_name.stdout | trim }}
+  loop: "{{ cluster_images_raw.stdout_lines | default([]) }}"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: dojo_import_results
+  changed_when: false
+  ignore_errors: yes
+  when:
+    - dojo_token_final != ''
+    - dojo_engagement_id != ''
+    - django_pod_name.stdout | default('') | trim != ''
+    - cluster_images_raw.stdout_lines | default([]) | length > 0
+
+- name: Display import results
+  debug:
+    msg: "{{ item.item | default('') }} → {{ item.stdout | default('skipped') }}"
+  loop: "{{ dojo_import_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('') }}"
+  run_once: true
+  when:
+    - dojo_import_results is defined
+    - dojo_import_results.results | default([]) | length > 0
+    - not item.skipped | default(false)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML REPORT
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Deploy HTML report generator script
+  copy:
+    dest: /tmp/trivy_html_report.py
+    mode: "0755"
+    force: yes
+    content: |
+      import json, os
+      from datetime import datetime
+
+      reports_dir = "/tmp/trivy-reports"
+      output_file = "/tmp/trivy-report.html"
+
+      all_results = []
+      total_critical = 0
+      total_high = 0
+      images_scanned = 0
+
+      for fname in sorted(os.listdir(reports_dir)):
+          if not fname.endswith(".json"):
+              continue
+          fpath = os.path.join(reports_dir, fname)
+          try:
+              with open(fpath) as f:
+                  data = json.load(f)
+          except Exception:
+              continue
+          image_name = data.get("ArtifactName", fname.replace(".json", ""))
+          images_scanned += 1
+          image_vulns = []
+          for r in data.get("Results", []):
+              for v in r.get("Vulnerabilities") or []:
+                  sev = v.get("Severity", "?")
+                  if sev == "CRITICAL":
+                      total_critical += 1
+                  elif sev == "HIGH":
+                      total_high += 1
+                  image_vulns.append({
+                      "severity": sev,
+                      "cve": v.get("VulnerabilityID", "?"),
+                      "package": v.get("PkgName", "?"),
+                      "installed": v.get("InstalledVersion", "?"),
+                      "fixed": v.get("FixedVersion", "N/A"),
+                      "title": v.get("Title", ""),
+                      "target": r.get("Target", "?"),
+                  })
+          all_results.append({"image": image_name, "vulns": image_vulns})
+
+      rows = ""
+      for res in all_results:
+          image = res["image"]
+          if not res["vulns"]:
+              rows += '<tr><td colspan="7" class="no-vuln">✓ ' + image + ' — No HIGH/CRITICAL vulnerabilities</td></tr>'
+              continue
+          for i, v in enumerate(res["vulns"]):
+              sev_class = "critical" if v["severity"] == "CRITICAL" else "high"
+              img_cell = '<td rowspan="' + str(len(res["vulns"])) + '" class="image-cell">' + image + '</td>' if i == 0 else ""
+              rows += (
+                  '<tr class="' + sev_class + '">'
+                  + img_cell
+                  + '<td><span class="badge ' + sev_class + '">' + v["severity"] + '</span></td>'
+                  + '<td><a href="https://nvd.nist.gov/vuln/detail/' + v["cve"] + '" target="_blank">' + v["cve"] + '</a></td>'
+                  + '<td>' + v["package"] + '</td>'
+                  + '<td>' + v["installed"] + '</td>'
+                  + '<td>' + (v["fixed"] or "N/A") + '</td>'
+                  + '<td>' + v["title"] + '</td>'
+                  + '</tr>'
+              )
+
+      html = """<!DOCTYPE html><html lang="fr"><head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Trivy Security Report</title>
+      <style>
+      body{font-family:Arial,sans-serif;background:#0f1117;color:#e0e0e0;margin:0;padding:20px}
+      h1{color:#fff;text-align:center;margin-bottom:5px}
+      .subtitle{text-align:center;color:#888;margin-bottom:30px;font-size:.9em}
+      .stats{display:flex;gap:20px;justify-content:center;margin-bottom:30px;flex-wrap:wrap}
+      .stat-box{background:#1e2130;border-radius:10px;padding:20px 40px;text-align:center}
+      .stat-box .number{font-size:2.5em;font-weight:bold}
+      .stat-box .label{color:#888;font-size:.85em;margin-top:5px}
+      .stat-box.critical .number{color:#ff4d4d}
+      .stat-box.high .number{color:#ff9900}
+      .stat-box.total .number{color:#4dabf7}
+      table{width:100%;border-collapse:collapse;background:#1e2130;border-radius:10px;overflow:hidden}
+      thead{background:#2a2d3e}
+      th{padding:12px 15px;text-align:left;font-size:.85em;color:#aaa;text-transform:uppercase}
+      td{padding:10px 15px;border-bottom:1px solid #2a2d3e;font-size:.88em;vertical-align:top}
+      .image-cell{font-weight:bold;color:#4dabf7;font-size:.8em;word-break:break-all;max-width:200px}
+      .badge{padding:3px 8px;border-radius:4px;font-size:.8em;font-weight:bold}
+      .badge.critical{background:#ff4d4d22;color:#ff4d4d;border:1px solid #ff4d4d}
+      .badge.high{background:#ff990022;color:#ff9900;border:1px solid #ff9900}
+      a{color:#4dabf7;text-decoration:none}
+      a:hover{text-decoration:underline}
+      .no-vuln{color:#4caf50;text-align:center;padding:15px}
+      tr:hover td{background:#252840}
+      .filter-bar{margin-bottom:15px;display:flex;gap:10px;flex-wrap:wrap}
+      .filter-bar input{background:#1e2130;border:1px solid #333;color:#fff;padding:8px 12px;border-radius:6px;width:300px}
+      .filter-bar button{background:#2a2d3e;border:1px solid #444;color:#fff;padding:8px 15px;border-radius:6px;cursor:pointer}
+      .filter-bar button:hover{background:#3a3d5e}
+      .filter-bar button.active{background:#ff4d4d33;border-color:#ff4d4d;color:#ff4d4d}
+      </style></head><body>
+      <h1>🔒 Trivy Security Report</h1>
+      <div class="subtitle">Generated: """ + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + """ | Kubernetes Cluster Scan</div>
+      <div class="stats">
+      <div class="stat-box total"><div class="number">""" + str(images_scanned) + """</div><div class="label">Images Scanned</div></div>
+      <div class="stat-box critical"><div class="number">""" + str(total_critical) + """</div><div class="label">CRITICAL</div></div>
+      <div class="stat-box high"><div class="number">""" + str(total_high) + """</div><div class="label">HIGH</div></div>
+      <div class="stat-box total"><div class="number">""" + str(total_critical + total_high) + """</div><div class="label">Total Findings</div></div>
+      </div>
+      <div class="filter-bar">
+      <input type="text" id="searchInput" placeholder="Search CVE, package, image..." onkeyup="filterTable()">
+      <button onclick="filterSeverity('ALL')" class="active" id="btn-ALL">All</button>
+      <button onclick="filterSeverity('CRITICAL')" id="btn-CRITICAL">Critical</button>
+      <button onclick="filterSeverity('HIGH')" id="btn-HIGH">High</button>
+      </div>
+      <table id="vulnTable"><thead><tr>
+      <th>Image</th><th>Severity</th><th>CVE</th><th>Package</th><th>Installed</th><th>Fixed In</th><th>Description</th>
+      </tr></thead><tbody>""" + rows + """</tbody></table>
+      <script>
+      var currentFilter="ALL";
+      function filterTable(){
+        var q=document.getElementById("searchInput").value.toLowerCase();
+        document.querySelectorAll("#vulnTable tbody tr").forEach(function(row){
+          var text=row.innerText.toLowerCase();
+          var sevMatch=currentFilter==="ALL"||text.includes(currentFilter.toLowerCase());
+          row.style.display=(text.includes(q)&&sevMatch)?"":"none";
+        });
+      }
+      function filterSeverity(sev){
+        currentFilter=sev;
+        ["ALL","CRITICAL","HIGH"].forEach(function(s){
+          document.getElementById("btn-"+s).classList.toggle("active",s===sev);
+        });
+        filterTable();
+      }
+      </script></body></html>"""
+
+      with open(output_file, "w") as f:
+          f.write(html)
+      print(output_file)
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Generate HTML report
+  command: python3 /tmp/trivy_html_report.py
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  register: html_report_path
+  changed_when: false
+  ignore_errors: yes
+
+- name: Confirm HTML report generated
+  debug:
+    msg: "Rapport HTML : {{ html_report_path.stdout }}"
+  run_once: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FINAL SUMMARY
+# ══════════════════════════════════════════════════════════════════════════════
+
+- name: Display final summary
+  debug:
+    msg:
+      - "╔══════════════════════════════════════════╗"
+      - "║     Trivy + DefectDojo - Résumé Final    ║"
+      - "╚══════════════════════════════════════════╝"
+      - "Images scannées    : {{ cluster_images_raw.stdout_lines | length | default(0) }}"
+      - "Rapports JSON/SARIF: /tmp/trivy-reports/"
+      - "Rapport HTML       : /tmp/trivy-report.html"
+      - "--------------------------------------------"
+      - "Admin Password     : {{ dojo_admin_password.stdout | default('N/A') }}"
+      - "API Token          : {{ dojo_token_final if dojo_token_final != '' else 'ECHEC' }}"
+      - "Product ID         : {{ dojo_product_id | default('N/A') }}"
+      - "Engagement Name    : {{ dojo_engagement_name | default('N/A') }}"
+      - "Engagement ID      : {{ dojo_engagement_id | default('N/A') }}"
+      - "--------------------------------------------"
+      - "Port-forward       : kubectl port-forward svc/defectdojo-django 8080:80 -n defectdojo --address 0.0.0.0"
+      - "URL                : http://{{ ansible_host }}:8080"
+      - "User               : admin"
+      - "Pass               : {{ dojo_admin_password.stdout | default('N/A') }}"
+  run_once: true
+
+- name: Save DefectDojo config to file
+  copy:
+    dest: /tmp/defectdojo-config.json
+    mode: "0644"
+    content: |
+      {
+        "timestamp": "{{ ansible_date_time.iso8601 }}",
+        "defectdojo": {
+          "admin_user": "admin",
+          "admin_password": "{{ dojo_admin_password.stdout | default('') }}",
+          "api_token": "{{ dojo_token_final | default('') }}",
+          "url": "http://{{ ansible_host }}:8080"
+        },
+        "product": {
+          "id": {{ dojo_product_id | default(0) }},
+          "name": "Kubernetes Cluster Security"
+        },
+        "engagement": {
+          "id": {{ dojo_engagement_id | default(0) }},
+          "name": "{{ dojo_engagement_name | default('') }}"
+        },
+        "trivy": {
+          "images_scanned": {{ cluster_images_raw.stdout_lines | length | default(0) }},
+          "reports_directory": "/tmp/trivy-reports/",
+          "html_report": "/tmp/trivy-report.html"
+        }
+      }
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes

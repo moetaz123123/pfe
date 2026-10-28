@@ -1,0 +1,26 @@
+---
+- name: Install kube-hunter via pip
+  pip:
+    name: kube-hunter
+    state: present
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Run kube-hunter
+  command: kube-hunter --pod --network --interface all
+  register: kube_hunter_output
+  changed_when: false
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Save kube-hunter report
+  copy:
+    content: "{{ kube_hunter_output.stdout | default('') }}"
+    dest: "/var/log/kube-hunter-report-{{ ansible_date_time.date }}.log"
+    mode: "0644"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+

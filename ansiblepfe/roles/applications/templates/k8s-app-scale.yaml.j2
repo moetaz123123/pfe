@@ -1,0 +1,222 @@
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ app_namespace }}
+
+---
+# ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ app_name }}-sa
+  namespace: {{ app_namespace }}
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ app_name }}
+  namespace: {{ app_namespace }}
+  labels:
+    app: {{ app_name }}
+spec:
+  replicas: {{ app_replicas | default(3) }}
+  selector:
+    matchLabels:
+      app: {{ app_name }}
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels:
+        app: {{ app_name }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "80"
+
+    spec:
+      serviceAccountName: {{ app_name }}-sa
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+
+      containers:
+        - name: {{ app_name }}
+          image: "{{ app_image | default('nginxinc/nginx-unprivileged:latest') }}"
+          imagePullPolicy: IfNotPresent
+
+          # IMPORTANT:
+          # nginxinc/nginx-unprivileged fonctionne en non-root
+          # et, dans ton environnement, écoute sur le port 80.
+          ports:
+            - name: http-web
+              containerPort: 80
+              protocol: TCP
+
+          resources:
+            requests:
+              cpu: {{ app_cpu_request | default('100m') }}
+              memory: {{ app_memory_request | default('128Mi') }}
+            limits:
+              cpu: {{ app_cpu_limit | default('500m') }}
+              memory: {{ app_memory_limit | default('256Mi') }}
+
+          readinessProbe:
+            httpGet:
+              path: {{ app_ready_path | default('/') }}
+              port: http-web
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+
+          livenessProbe:
+            httpGet:
+              path: {{ app_health_path | default('/') }}
+              port: http-web
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
+
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ app_name }}-service
+  namespace: {{ app_namespace }}
+  labels:
+    app: {{ app_name }}
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ app_name }}
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: http-web
+
+---
+# HorizontalPodAutoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ app_name }}-hpa
+  namespace: {{ app_namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ app_name }}
+
+  minReplicas: {{ hpa_min_replicas | default(2) }}
+  maxReplicas: {{ hpa_max_replicas | default(10) }}
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ hpa_cpu_threshold | default(70) }}
+
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ hpa_memory_threshold | default(80) }}
+
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 15
+
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 4
+          periodSeconds: 15
+      selectPolicy: Max
+
+---
+# PodDisruptionBudget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ app_name }}-pdb
+  namespace: {{ app_namespace }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: {{ app_name }}
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ app_name }}-ingress
+  namespace: {{ app_namespace }}
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: {{ app_hostname | default('scaling-app.local') }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ app_name }}-service
+                port:
+                  number: 80

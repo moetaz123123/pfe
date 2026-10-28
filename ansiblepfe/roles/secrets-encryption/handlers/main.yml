@@ -1,0 +1,19 @@
+---
+# ============================================================
+# SECRETS ENCRYPTION HANDLERS
+# ============================================================
+
+- name: Restart kube-apiserver for encryption
+  command: kubectl rollout restart deployment/kube-apiserver -n kube-system
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  listen: "restart-apiserver-encryption"
+
+- name: Verify API server readiness
+  uri:
+    url: "https://127.0.0.1:6443/readyz"
+    validate_certs: no
+    status_code: 200
+  retries: 30
+  delay: 5
+  listen: "verify-apiserver"

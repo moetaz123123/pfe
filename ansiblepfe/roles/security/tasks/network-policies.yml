@@ -1,0 +1,16 @@
+---
+- name: Render NetworkPolicy manifests
+  template:
+    src: network-policies.yaml
+    dest: /tmp/network-policies.yaml
+    mode: "0644"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Apply NetworkPolicies
+  command: kubectl apply -f /tmp/network-policies.yaml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+

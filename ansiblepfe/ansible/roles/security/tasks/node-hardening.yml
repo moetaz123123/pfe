@@ -1,0 +1,84 @@
+---
+- name: Ensure UFW and fail2ban are installed
+  apt:
+    name:
+      - ufw
+      - fail2ban
+    state: present
+    update_cache: yes
+
+- name: Configure SSH security (sshd_config hardening)
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+    state: present
+  loop:
+    - { regexp: '^PermitRootLogin', line: 'PermitRootLogin no' }
+    - { regexp: '^PasswordAuthentication', line: 'PasswordAuthentication no' }
+    - { regexp: '^X11Forwarding', line: 'X11Forwarding no' }
+    - { regexp: '^ClientAliveInterval', line: 'ClientAliveInterval 300' }
+    - { regexp: '^MaxAuthTries', line: 'MaxAuthTries 3' }
+  notify: restart sshd
+
+- name: Configure firewall defaults (UFW)
+  command: ufw --force reset
+  changed_when: false
+  ignore_errors: yes
+
+- name: UFW default deny incoming, allow outgoing
+  command: "ufw default deny incoming"
+  changed_when: false
+
+- name: UFW allow outgoing
+  command: "ufw default allow outgoing"
+  changed_when: false
+
+- name: Allow SSH from internal network
+  command: "ufw allow from {{ internal_cidr }} to any port 22 proto tcp"
+  changed_when: false
+
+- name: Allow Kubernetes API server (6443) from anywhere (as in PDF)
+  command: "ufw allow 6443/tcp"
+  changed_when: false
+
+- name: Allow kubelet (10250) from internal network
+  command: "ufw allow from {{ internal_cidr }} to any port 10250 proto tcp"
+  changed_when: false
+
+- name: Allow etcd (2379) from internal network (master only)
+  command: "ufw allow from {{ internal_cidr }} to any port 2379 proto tcp"
+  changed_when: false
+  when: inventory_hostname in groups['master']
+
+- name: Allow scheduler/controller-manager ports (localhost)
+  command: "ufw allow from 127.0.0.1 to any port {{ item }} proto tcp"
+  loop:
+    - 10251
+    - 10252
+  changed_when: false
+
+- name: Enable UFW
+  command: ufw --force enable
+  changed_when: false
+
+- name: Enable fail2ban
+  systemd:
+    name: fail2ban
+    state: started
+    enabled: yes
+
+- name: Configure fail2ban for SSH
+  copy:
+    dest: /etc/fail2ban/jail.local
+    mode: "0644"
+    content: |
+      [sshd]
+      enabled = true
+      port = ssh
+      filter = sshd
+      logpath = /var/log/auth.log
+      maxretry = 3
+      bantime = 3600
+  notify: restart fail2ban
+

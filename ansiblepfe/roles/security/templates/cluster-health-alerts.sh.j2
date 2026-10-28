@@ -1,0 +1,697 @@
+#!/bin/bash
+# Généré par Ansible — alertes cluster (pods, nœuds, audit) vers {{ email_recipient }}
+set -euo pipefail
+
+export KUBECONFIG="${KUBECONFIG:-/etc/kubernetes/admin.conf}"
+if [[ ! -f "$KUBECONFIG" ]]; then
+  export KUBECONFIG="/home/ubuntu/.kube/config"
+fi
+
+PROJECT="{{ project_name | default('Kubernetes Cluster') }}"
+EMAIL_TO="{{ email_recipient }}"
+ONLY_ON_ISSUE={{ cluster_alert_send_only_on_issue | default(true) | lower }}
+AUDIT_PATH="{{ audit_log_path | default('/var/log/kubernetes/audit.log') }}"
+TH403={{ cluster_alert_audit_403_min | default(15) }}
+TH401={{ cluster_alert_audit_401_min | default(8) }}
+HOST="$(hostname -f 2>/dev/null || hostname)"
+NOW="$(date -Iseconds)"
+NOW_PRETTY="$(date '+%d/%m/%Y à %H:%M:%S')"
+WINDOW_LABEL="15 dernières minutes"
+
+TMP_HTML="$(mktemp /tmp/cluster-alert-XXXXXX.html)"
+trap 'rm -f "$TMP_HTML"' EXIT
+
+# ── Collecte pods ─────────────────────────────────────────────────────────────
+readarray -t POD_ROWS < <(python3 << 'PY'
+import json, subprocess, os, sys
+os.environ.setdefault("KUBECONFIG", "/etc/kubernetes/admin.conf")
+try:
+    raw = subprocess.check_output(
+        ["kubectl", "get", "pods", "-A", "-o", "json"],
+        stderr=subprocess.DEVNULL,
+    )
+except (subprocess.CalledProcessError, FileNotFoundError):
+    sys.exit(0)
+pods = json.loads(raw)
+bad_reasons = {
+    "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull",
+    "CreateContainerConfigError", "InvalidImageName", "BackOff",
+}
+for it in pods.get("items", []):
+    ns = it["metadata"]["namespace"]
+    name = it["metadata"]["name"]
+    phase = it["status"].get("phase", "")
+    if phase == "Pending":
+        print(f"{ns}\t{name}\tPending\tworkload")
+        continue
+    if phase == "Failed":
+        print(f"{ns}\t{name}\tFailed\tworkload")
+    for key in ("containerStatuses", "initContainerStatuses"):
+        for c in it["status"].get(key) or []:
+            st = c.get("state") or {}
+            w = st.get("waiting") or {}
+            r = w.get("reason") or ""
+            if r in bad_reasons:
+                role = "init" if key.startswith("init") else "container"
+                print(f"{ns}\t{name}\t{r}\t{role}")
+            t = st.get("terminated") or {}
+            if t.get("reason") == "OOMKilled":
+                role = "init" if key.startswith("init") else "container"
+                print(f"{ns}\t{name}\tOOMKilled\t{role}")
+PY
+)
+
+# ── Collecte nœuds ────────────────────────────────────────────────────────────
+readarray -t NODE_ROWS < <(python3 << 'PY'
+import json, subprocess, os, sys
+os.environ.setdefault("KUBECONFIG", "/etc/kubernetes/admin.conf")
+try:
+    raw = subprocess.check_output(
+        ["kubectl", "get", "nodes", "-o", "json"],
+        stderr=subprocess.DEVNULL,
+    )
+except (subprocess.CalledProcessError, FileNotFoundError):
+    sys.exit(0)
+d = json.loads(raw)
+for it in d.get("items", []):
+    n = it["metadata"]["name"]
+    problems = []
+    for c in it["status"].get("conditions") or []:
+        t, s = c.get("type"), c.get("status")
+        if t == "Ready" and s != "True":
+            problems.append(f"Ready={s}")
+        if t == "DiskPressure" and s == "True":
+            problems.append("DiskPressure")
+        if t == "MemoryPressure" and s == "True":
+            problems.append("MemoryPressure")
+        if t == "PIDPressure" and s == "True":
+            problems.append("PIDPressure")
+    if problems:
+        print(f"{n}\t" + ", ".join(problems))
+PY
+)
+
+# ── Analyse audit log enrichie (fenêtre 15 min) ───────────────────────────────
+read -r AUDIT401 AUDIT403 AUDIT_DELETES AUDIT_SECRETS AUDIT_EXEC AUDIT_TOTAL \
+  AUDIT_TOP_USER AUDIT_TOP_USER_COUNT AUDIT_TOP_NS AUDIT_TOP_NS_COUNT \
+  AUDIT_VERB_GET AUDIT_VERB_CREATE AUDIT_VERB_DELETE AUDIT_VERB_UPDATE AUDIT_VERB_PATCH \
+  AUDIT_RECENT_403 < <(python3 << PY
+import json, os, time, collections
+
+path = r"""$AUDIT_PATH"""
+window_sec = 900   # 15 min
+max_bytes  = 20_000_000
+
+now_ts = time.time()
+cutoff  = now_ts - window_sec
+
+try:
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        sz = f.tell()
+        f.seek(max(0, sz - max_bytes))
+        chunk = f.read().decode("utf-8", errors="ignore")
+except OSError:
+    chunk = ""
+
+lines = chunk.splitlines()
+
+c401 = c403 = deletes = secrets = exec_events = total = 0
+v_get = v_create = v_delete = v_update = v_patch = 0
+users   = collections.Counter()
+nspaces = collections.Counter()
+recent_403_lines = []
+
+for line in lines:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except Exception:
+        continue
+
+    ts_str = ev.get("requestReceivedTimestamp") or ev.get("stageTimestamp") or ""
+    if ts_str:
+        try:
+            import datetime
+            ts = datetime.datetime.fromisoformat(ts_str.rstrip("Z")).replace(
+                tzinfo=datetime.timezone.utc).timestamp()
+            if ts < cutoff:
+                continue
+        except Exception:
+            pass
+
+    total += 1
+    code = (ev.get("responseStatus") or {}).get("code", 0)
+    verb = ev.get("verb", "")
+    user = (ev.get("user") or {}).get("username", "unknown")
+    obj  = ev.get("objectRef") or {}
+    ns   = obj.get("namespace", "")
+    res  = obj.get("resource", "")
+
+    if code == 401: c401 += 1
+    if code == 403:
+        c403 += 1
+        recent_403_lines.append(
+            f"{user} → {verb} {res}" + (f" [{ns}]" if ns else "")
+        )
+    if verb == "delete":  deletes += 1
+    if res  == "secrets": secrets += 1
+    if res in ("pods/exec", "pods/attach", "pods/portforward"): exec_events += 1
+
+    if verb == "get":    v_get    += 1
+    elif verb == "create": v_create += 1
+    elif verb == "delete": v_delete += 1
+    elif verb == "update": v_update += 1
+    elif verb == "patch":  v_patch  += 1
+
+    if user and not user.startswith("system:"):
+        users[user] += 1
+    if ns:
+        nspaces[ns] += 1
+
+top_user, top_user_cnt = ("—", 0)
+if users:
+    top_user, top_user_cnt = users.most_common(1)[0]
+
+top_ns, top_ns_cnt = ("—", 0)
+if nspaces:
+    top_ns, top_ns_cnt = nspaces.most_common(1)[0]
+
+last3_403 = " | ".join(recent_403_lines[-3:]) if recent_403_lines else "—"
+
+print(c401, c403, deletes, secrets, exec_events, total,
+      top_user, top_user_cnt, top_ns, top_ns_cnt,
+      v_get, v_create, v_delete, v_update, v_patch,
+      last3_403)
+PY
+)
+
+# Defaults si Python indisponible
+AUDIT401=${AUDIT401:-0}
+AUDIT403=${AUDIT403:-0}
+AUDIT_DELETES=${AUDIT_DELETES:-0}
+AUDIT_SECRETS=${AUDIT_SECRETS:-0}
+AUDIT_EXEC=${AUDIT_EXEC:-0}
+AUDIT_TOTAL=${AUDIT_TOTAL:-0}
+AUDIT_TOP_USER=${AUDIT_TOP_USER:-—}
+AUDIT_TOP_USER_COUNT=${AUDIT_TOP_USER_COUNT:-0}
+AUDIT_TOP_NS=${AUDIT_TOP_NS:-—}
+AUDIT_TOP_NS_COUNT=${AUDIT_TOP_NS_COUNT:-0}
+AUDIT_VERB_GET=${AUDIT_VERB_GET:-0}
+AUDIT_VERB_CREATE=${AUDIT_VERB_CREATE:-0}
+AUDIT_VERB_DELETE=${AUDIT_VERB_DELETE:-0}
+AUDIT_VERB_UPDATE=${AUDIT_VERB_UPDATE:-0}
+AUDIT_VERB_PATCH=${AUDIT_VERB_PATCH:-0}
+AUDIT_RECENT_403="${AUDIT_RECENT_403:-—}"
+
+# ── Seuils & indicateurs ──────────────────────────────────────────────────────
+AUDIT_ISSUE=0
+if (( AUDIT403 >= TH403 )) || (( AUDIT401 >= TH401 )); then
+  AUDIT_ISSUE=1
+fi
+
+POD_ISSUE=0
+if (( {{ '$' ~ '{' ~ '#POD_ROWS[@]' ~ '}' }} > 0 )); then
+  POD_ISSUE=1
+fi
+
+NODE_ISSUE=0
+if (( {{ '$' ~ '{' ~ '#NODE_ROWS[@]' ~ '}' }} > 0 )); then
+  NODE_ISSUE=1
+fi
+
+HAS_ISSUE=$(( POD_ISSUE + NODE_ISSUE + AUDIT_ISSUE ))
+
+if [[ "$ONLY_ON_ISSUE" == "true" ]] && (( HAS_ISSUE == 0 )); then
+  exit 0
+fi
+
+SUBJECT="[${PROJECT}] ⚠ Alerte cluster — ${NOW}"
+if (( HAS_ISSUE == 0 )); then
+  SUBJECT="[${PROJECT}] ✅ Rapport santé cluster — OK — ${NOW}"
+fi
+
+# ── Helpers HTML ──────────────────────────────────────────────────────────────
+
+badge_state() {
+  local state="$1"
+  case "$state" in
+    CrashLoopBackOff|OOMKilled|Failed|ErrImagePull|InvalidImageName|CreateContainerConfigError)
+      echo "<span class=\"badge badge-red\">${state}</span>"
+      ;;
+    ImagePullBackOff|Pending|BackOff)
+      echo "<span class=\"badge badge-orange\">${state}</span>"
+      ;;
+    *)
+      echo "<span class=\"badge badge-gray\">${state}</span>"
+      ;;
+  esac
+}
+
+badge_role() {
+  echo "<span class=\"badge badge-blue\">${1}</span>"
+}
+
+mono() {
+  echo "<code class=\"mono\">${1}</code>"
+}
+
+pod_rows_html() {
+  if (($# == 0)); then
+    echo "<tr><td colspan=\"4\" class=\"empty-row\">✓ Aucun pod en erreur détecté</td></tr>"
+    return
+  fi
+  local i=0
+  for line in "$@"; do
+    IFS=$'\t' read -r c1 c2 c3 c4 <<<"$line"
+    local cls=""
+    (( i % 2 == 1 )) && cls=" row-alt"
+    echo "<tr class=\"data-row${cls}\">
+      <td>$(mono "$c1")</td>
+      <td>$(mono "$c2")</td>
+      <td>$(badge_state "$c3")</td>
+      <td>$(badge_role "$c4")</td>
+    </tr>"
+    (( i++ )) || true
+  done
+}
+
+node_rows_html() {
+  if (($# == 0)); then
+    echo "<tr><td colspan=\"2\" class=\"empty-row\">✓ Tous les nœuds sont opérationnels</td></tr>"
+    return
+  fi
+  local i=0
+  for line in "$@"; do
+    IFS=$'\t' read -r n prob <<<"$line"
+    badges=""
+    IFS=',' read -ra parts <<< "$prob"
+    for p in "${parts[@]}"; do
+      p="${p## }"; p="${p%% }"
+      badges+="$(badge_state "$p") "
+    done
+    local cls=""
+    (( i % 2 == 1 )) && cls=" row-alt"
+    echo "<tr class=\"data-row${cls}\">
+      <td>$(mono "$n")</td>
+      <td>${badges}</td>
+    </tr>"
+    (( i++ )) || true
+  done
+}
+
+# Barre de progression pour verbes
+verb_bar() {
+  local count=$1 total=$2 color=$3
+  local pct=0
+  (( total > 0 )) && pct=$(( count * 100 / total )) || true
+  echo "<div class=\"verb-bar-wrap\">
+    <div class=\"verb-bar-track\">
+      <div class=\"verb-bar-fill\" style=\"width:${pct}%;background:${color};\"></div>
+    </div>
+    <span class=\"verb-bar-count\">${count}</span>
+  </div>"
+}
+
+NODE_ROWS_HTML=$(node_rows_html "${NODE_ROWS[@]+"${NODE_ROWS[@]}"}")
+POD_ROWS_HTML=$(pod_rows_html "${POD_ROWS[@]+"${POD_ROWS[@]}"}")
+
+POD_COUNT={{ '$' ~ '{' ~ '#POD_ROWS[@]' ~ '}' }}
+NODE_COUNT={{ '$' ~ '{' ~ '#NODE_ROWS[@]' ~ '}' }}
+
+# Couleurs cartes de statut
+if (( POD_COUNT  == 0 )); then POD_COLOR="#16a34a";  else POD_COLOR="#dc2626";  fi
+if (( NODE_COUNT == 0 )); then NODE_COLOR="#16a34a"; else NODE_COLOR="#dc2626"; fi
+if (( AUDIT_ISSUE == 0 )); then A403_COLOR="#16a34a"; else A403_COLOR="#dc2626"; fi
+if (( AUDIT401 < TH401 )); then A401_COLOR="#16a34a"; else A401_COLOR="#d97706"; fi
+
+# Badge statut global
+if (( HAS_ISSUE > 0 )); then
+  GLOBAL_BADGE='<div class="status-banner status-alert">&#9888;&nbsp; ALERTE — Intervention requise</div>'
+else
+  GLOBAL_BADGE='<div class="status-banner status-ok">&#10003;&nbsp; CLUSTER STABLE — Aucune anomalie</div>'
+fi
+
+# Sous-label statut pod/node
+POD_SUB="${POD_ISSUE:+⚠ anomalie}"; POD_SUB="${POD_SUB:-✓ OK}"
+NODE_SUB="${NODE_ISSUE:+⚠ anomalie}"; NODE_SUB="${NODE_SUB:-✓ OK}"
+
+# Bloc détail audit 403
+if (( AUDIT_ISSUE )); then
+  AUDIT_DETAIL_BLOCK='<div class="alert-box alert-red">
+    <div class="alert-box-title">&#128683; Seuils de sécurité dépassés</div>
+    <table style="width:100%;border-collapse:collapse;margin-top:8px;">
+      <tr>
+        <td class="alert-td">&#128273; Non-authentifié <strong>(401)</strong></td>
+        <td class="alert-td-r"><span class="badge badge-orange">'${AUDIT401}' occurrences</span>
+          <span class="threshold-label">seuil ≥ '${TH401}'</span></td>
+      </tr>
+      <tr>
+        <td class="alert-td">&#128683; Accès refusé <strong>(403)</strong></td>
+        <td class="alert-td-r"><span class="badge badge-red">'${AUDIT403}' occurrences</span>
+          <span class="threshold-label">seuil ≥ '${TH403}'</span></td>
+      </tr>
+    </table>
+    <div class="recent-label">Derniers événements 403 :</div>
+    <div class="recent-block">'${AUDIT_RECENT_403}'</div>
+  </div>'
+else
+  AUDIT_DETAIL_BLOCK='<div class="alert-box alert-green">
+    &#10003; Volume 401/403 dans les seuils &mdash;
+    <strong>401&nbsp;=&nbsp;'${AUDIT401}'</strong>,
+    <strong>403&nbsp;=&nbsp;'${AUDIT403}'</strong>
+    (seuils&nbsp;: '${TH401}' / '${TH403}')
+  </div>'
+fi
+
+# Barres verbes
+VERB_TOTAL=$(( AUDIT_VERB_GET + AUDIT_VERB_CREATE + AUDIT_VERB_DELETE + AUDIT_VERB_UPDATE + AUDIT_VERB_PATCH ))
+BAR_GET=$(    verb_bar "$AUDIT_VERB_GET"    "$VERB_TOTAL" "#3b82f6")
+BAR_CREATE=$( verb_bar "$AUDIT_VERB_CREATE" "$VERB_TOTAL" "#10b981")
+BAR_DELETE=$( verb_bar "$AUDIT_VERB_DELETE" "$VERB_TOTAL" "#ef4444")
+BAR_UPDATE=$( verb_bar "$AUDIT_VERB_UPDATE" "$VERB_TOTAL" "#f59e0b")
+BAR_PATCH=$(  verb_bar "$AUDIT_VERB_PATCH"  "$VERB_TOTAL" "#8b5cf6")
+
+# ── Template HTML — thème clair (fond blanc) ──────────────────────────────────
+cat >"$TMP_HTML" <<HTMLEOF
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kubernetes Cluster Alert</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: #f1f5f9;
+    color: #1e293b;
+    font-size: 14px;
+    line-height: 1.5;
+    padding: 0;
+  }
+  .wrapper {
+    max-width: 700px;
+    margin: 28px auto;
+    background: #ffffff;
+    border-radius: 16px;
+    overflow: hidden;
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 8px 32px rgba(15,23,42,.10);
+  }
+  /* ── Header ── */
+  .header {
+    background: linear-gradient(135deg, #1e3a8a 0%, #1d4ed8 50%, #1e3a8a 100%);
+    border-bottom: 1px solid #3b82f6;
+    padding: 32px 36px 28px;
+  }
+  .header-eyebrow {
+    font-size: 10px; letter-spacing: .18em; text-transform: uppercase;
+    color: #bfdbfe; margin-bottom: 10px; font-weight: 600;
+  }
+  .header-title {
+    font-size: 22px; font-weight: 700; color: #ffffff;
+    margin-bottom: 4px; letter-spacing: -.3px;
+  }
+  .header-sub {
+    font-size: 12px; color: #bfdbfe;
+    display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px;
+  }
+  .header-sub span { display: flex; align-items: center; gap: 5px; }
+  /* ── Status banner ── */
+  .status-banner {
+    border-radius: 8px; padding: 10px 16px; font-size: 13px; font-weight: 600;
+    display: inline-block; margin-top: 18px;
+  }
+  .status-ok    { background: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0; }
+  .status-alert { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
+  /* ── Summary cards ── */
+  .cards { display: flex; gap: 12px; padding: 24px 36px 0; }
+  .card {
+    flex: 1; border-radius: 10px; padding: 16px 14px 14px;
+    text-align: center; border: 1px solid #e2e8f0; background: #f8fafc;
+  }
+  .card-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .1em;
+    color: #64748b; font-weight: 600; margin-bottom: 8px;
+  }
+  .card-value {
+    font-size: 28px; font-weight: 800; letter-spacing: -1px; line-height: 1; margin-bottom: 4px;
+  }
+  .card-sub { font-size: 10px; margin-top: 5px; opacity: .85; }
+  /* ── Sections ── */
+  .body { padding: 28px 36px 36px; }
+  .section { margin-bottom: 32px; }
+  .section-header {
+    display: flex; align-items: center; gap: 10px;
+    padding-bottom: 10px; border-bottom: 1px solid #e2e8f0; margin-bottom: 16px;
+  }
+  .section-num {
+    font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase;
+    color: #1d4ed8; background: #eff6ff; border: 1px solid #bfdbfe;
+    border-radius: 4px; padding: 3px 7px;
+  }
+  .section-title {
+    font-size: 13px; font-weight: 600; color: #334155;
+    letter-spacing: .02em; text-transform: uppercase;
+  }
+  .section-desc { font-size: 12px; color: #64748b; margin-bottom: 14px; line-height: 1.6; }
+  /* ── Tables ── */
+  table.data { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; border: 1px solid #e2e8f0; }
+  table.data thead tr { background: #1e3a8a; }
+  table.data thead th {
+    padding: 10px 12px; text-align: left; font-weight: 600; font-size: 10px;
+    letter-spacing: .08em; text-transform: uppercase; color: #bfdbfe;
+    border-bottom: 1px solid #3b82f6;
+  }
+  tr.data-row td { padding: 10px 12px; border-bottom: 1px solid #f1f5f9; color: #334155; background: #ffffff; }
+  tr.data-row:last-child td { border-bottom: none; }
+  tr.row-alt td { background: #f8fafc; }
+  .empty-row { padding: 16px 12px; color: #64748b; font-size: 12px; font-style: italic; background: #ffffff; }
+  /* ── Badges ── */
+  .badge { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .badge-red    { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
+  .badge-orange { background: #fff7ed; color: #ea580c; border: 1px solid #fed7aa; }
+  .badge-gray   { background: #f8fafc; color: #64748b; border: 1px solid #e2e8f0; }
+  .badge-blue   { background: #eff6ff; color: #2563eb; border: 1px solid #bfdbfe; }
+  /* ── Mono ── */
+  code.mono {
+    background: #f1f5f9; padding: 2px 7px; border-radius: 4px;
+    font-family: 'Courier New', monospace; font-size: 11px; color: #0369a1;
+    border: 1px solid #e2e8f0;
+  }
+  /* ── Alert boxes ── */
+  .alert-box { border-radius: 8px; padding: 16px; font-size: 12px; line-height: 1.7; }
+  .alert-red   { background: #fef2f2; border: 1px solid #fecaca; color: #7f1d1d; }
+  .alert-green { background: #f0fdf4; border: 1px solid #bbf7d0; color: #14532d; }
+  .alert-box-title { font-size: 13px; font-weight: 700; margin-bottom: 10px; }
+  .alert-td   { padding: 6px 10px; color: #991b1b; vertical-align: middle; }
+  .alert-td-r { padding: 6px 10px; text-align: right; vertical-align: middle; }
+  .threshold-label { font-size: 10px; color: #b91c1c; margin-left: 6px; }
+  .recent-label { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: #b91c1c; margin-top: 12px; margin-bottom: 5px; font-weight: 600; }
+  .recent-block { font-size: 11px; font-family: 'Courier New', monospace; color: #dc2626; background: #fff5f5; border: 1px solid #fecaca; border-radius: 5px; padding: 8px 10px; line-height: 1.8; }
+  /* ── Analytics grid ── */
+  .analytics-grid { display: flex; gap: 12px; margin-bottom: 16px; }
+  .analytics-card {
+    flex: 1; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px;
+  }
+  .analytics-card-label { font-size: 10px; text-transform: uppercase; letter-spacing: .1em; color: #64748b; margin-bottom: 6px; font-weight: 600; }
+  .analytics-card-value { font-size: 20px; font-weight: 700; color: #1e293b; letter-spacing: -.5px; }
+  .analytics-card-sub { font-size: 10px; color: #94a3b8; margin-top: 4px; }
+  /* ── Verb bars ── */
+  .verb-box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin-top: 16px; }
+  .verb-box-label { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: #64748b; font-weight: 600; margin-bottom: 12px; }
+  .verb-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .verb-table td { padding: 5px 6px; }
+  .verb-label { color: #64748b; width: 70px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .verb-bar-wrap { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+  .verb-bar-track { width: 90px; background: #e2e8f0; border-radius: 3px; height: 6px; overflow: hidden; }
+  .verb-bar-fill { height: 100%; border-radius: 3px; }
+  .verb-bar-count { font-size: 11px; color: #64748b; min-width: 30px; }
+  /* ── Top user/NS ── */
+  .top-grid { display: flex; gap: 12px; margin-top: 14px; }
+  .top-card {
+    flex: 1; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 14px;
+  }
+  .top-card-label { font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: .08em; font-weight: 600; margin-bottom: 5px; }
+  .top-card-value { font-size: 13px; color: #0369a1; font-family: 'Courier New', monospace; font-weight: 600; }
+  .top-card-count { font-size: 10px; color: #94a3b8; margin-top: 3px; }
+  /* ── Footer ── */
+  .footer {
+    background: #f8fafc; border-top: 1px solid #e2e8f0;
+    padding: 16px 36px; text-align: center;
+    font-size: 11px; color: #94a3b8; letter-spacing: .04em;
+  }
+</style>
+</head>
+<body>
+<div class="wrapper">
+
+  <!-- ══ HEADER ══ -->
+  <div class="header">
+    <div class="header-eyebrow">&#9679; Kubernetes Cluster Monitor</div>
+    <div class="header-title">Rapport de surveillance automatique</div>
+    <div class="header-sub">
+      <span>&#128421; ${PROJECT}</span>
+      <span>&#128290; ${HOST}</span>
+      <span>&#128336; ${NOW_PRETTY}</span>
+      <span>&#128202; Fenêtre : ${WINDOW_LABEL}</span>
+    </div>
+    ${GLOBAL_BADGE}
+  </div>
+
+  <!-- ══ SUMMARY CARDS ══ -->
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">Pods en erreur</div>
+      <div class="card-value" style="color:${POD_COLOR};">${POD_COUNT}</div>
+      <div class="card-sub" style="color:${POD_COLOR};">${POD_SUB}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Nœuds en alerte</div>
+      <div class="card-value" style="color:${NODE_COLOR};">${NODE_COUNT}</div>
+      <div class="card-sub" style="color:${NODE_COLOR};">${NODE_SUB}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Refus 403 (15 min)</div>
+      <div class="card-value" style="color:${A403_COLOR};">${AUDIT403}</div>
+      <div class="card-sub" style="color:${A403_COLOR};">seuil ≥ ${TH403}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Non-auth 401 (15 min)</div>
+      <div class="card-value" style="color:${A401_COLOR};">${AUDIT401}</div>
+      <div class="card-sub" style="color:${A401_COLOR};">seuil ≥ ${TH401}</div>
+    </div>
+  </div>
+
+  <!-- ══ BODY ══ -->
+  <div class="body">
+
+    <!-- ── SECTION 1 : PODS ── -->
+    <div class="section">
+      <div class="section-header">
+        <span class="section-num">01</span>
+        <span class="section-title">État des pods</span>
+      </div>
+      <p class="section-desc">
+        Détecte CrashLoopBackOff, ImagePullBackOff, Pending, OOMKilled et Failed sur tous les namespaces.
+      </p>
+      <table class="data">
+        <thead>
+          <tr>
+            <th style="width:22%;">Namespace</th>
+            <th style="width:38%;">Pod</th>
+            <th style="width:22%;">État</th>
+            <th style="width:18%;">Rôle</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${POD_ROWS_HTML}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ── SECTION 2 : NŒUDS ── -->
+    <div class="section">
+      <div class="section-header">
+        <span class="section-num">02</span>
+        <span class="section-title">État des nœuds</span>
+      </div>
+      <p class="section-desc">
+        NotReady, pression disque / mémoire / PID signalés par le kubelet.
+      </p>
+      <table class="data">
+        <thead>
+          <tr>
+            <th style="width:35%;">Nœud</th>
+            <th style="width:65%;">Problème détecté</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${NODE_ROWS_HTML}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ── SECTION 3 : AUDIT API ── -->
+    <div class="section">
+      <div class="section-header">
+        <span class="section-num">03</span>
+        <span class="section-title">Sécurité — Audit API Server</span>
+      </div>
+      <p class="section-desc">
+        Analyse des ${WINDOW_LABEL} &mdash;
+        fichier&nbsp;: <code class="mono">${AUDIT_PATH}</code>
+      </p>
+
+      <!-- Compteurs analytics -->
+      <div class="analytics-grid">
+        <div class="analytics-card">
+          <div class="analytics-card-label">Total événements</div>
+          <div class="analytics-card-value">${AUDIT_TOTAL}</div>
+          <div class="analytics-card-sub">${WINDOW_LABEL}</div>
+        </div>
+        <div class="analytics-card">
+          <div class="analytics-card-label">Suppressions (delete)</div>
+          <div class="analytics-card-value" style="color:#dc2626;">${AUDIT_DELETES}</div>
+          <div class="analytics-card-sub">verb=delete</div>
+        </div>
+        <div class="analytics-card">
+          <div class="analytics-card-label">Accès secrets</div>
+          <div class="analytics-card-value" style="color:#ea580c;">${AUDIT_SECRETS}</div>
+          <div class="analytics-card-sub">resource=secrets</div>
+        </div>
+        <div class="analytics-card">
+          <div class="analytics-card-label">Exec / Attach</div>
+          <div class="analytics-card-value" style="color:#7c3aed;">${AUDIT_EXEC}</div>
+          <div class="analytics-card-sub">pods/exec · attach · pf</div>
+        </div>
+      </div>
+
+      <!-- Alerte 401/403 -->
+      ${AUDIT_DETAIL_BLOCK}
+
+      <!-- Répartition des verbes -->
+      <div class="verb-box">
+        <div class="verb-box-label">Répartition des verbes HTTP</div>
+        <table class="verb-table">
+          <tr><td class="verb-label">GET</td><td>${BAR_GET}</td></tr>
+          <tr><td class="verb-label">CREATE</td><td>${BAR_CREATE}</td></tr>
+          <tr><td class="verb-label">DELETE</td><td>${BAR_DELETE}</td></tr>
+          <tr><td class="verb-label">UPDATE</td><td>${BAR_UPDATE}</td></tr>
+          <tr><td class="verb-label">PATCH</td><td>${BAR_PATCH}</td></tr>
+        </table>
+      </div>
+
+      <!-- Top utilisateur & namespace -->
+      <div class="top-grid">
+        <div class="top-card">
+          <div class="top-card-label">&#128100; Utilisateur le plus actif</div>
+          <div class="top-card-value">${AUDIT_TOP_USER}</div>
+          <div class="top-card-count">${AUDIT_TOP_USER_COUNT} requêtes (hors system:)</div>
+        </div>
+        <div class="top-card">
+          <div class="top-card-label">&#128193; Namespace le plus ciblé</div>
+          <div class="top-card-value">${AUDIT_TOP_NS}</div>
+          <div class="top-card-count">${AUDIT_TOP_NS_COUNT} événements</div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /body -->
+
+  <!-- ══ FOOTER ══ -->
+  <div class="footer">
+    Message automatique &mdash; ${PROJECT} &middot; Ansible / msmtp / mutt
+    &middot; Fréquence&nbsp;: toutes les 15 min
+  </div>
+
+</div>
+</body>
+</html>
+HTMLEOF
+
+/usr/bin/mutt -e "set content_type=text/html" -s "$SUBJECT" -- "$EMAIL_TO" <"$TMP_HTML"
+echo "Alerte cluster envoyée à $EMAIL_TO (issues=${HAS_ISSUE}, total_audit=${AUDIT_TOTAL})"

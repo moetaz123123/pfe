@@ -1,0 +1,445 @@
+---
+- name: Wait for API server to be ready
+  uri:
+    url: "https://localhost:6443/readyz"
+    validate_certs: no
+    status_code: 200
+  register: api_status
+  until: api_status.status == 200
+  retries: 30
+  delay: 10
+  delegate_to: "{{ groups['master'][0] }}"
+
+- name: Clean orphan containerd containers on all nodes
+  shell: |
+    crictl --runtime-endpoint unix:///run/containerd/containerd.sock rm \
+      $(crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -a -q 2>/dev/null) 2>/dev/null || true
+  ignore_errors: yes
+
+- name: Remove stale CNI interfaces on all nodes
+  shell: |
+    ip link set cni0 down 2>/dev/null || true
+    ip link delete cni0 2>/dev/null || true
+    ip link set flannel.1 down 2>/dev/null || true
+    ip link delete flannel.1 2>/dev/null || true
+    rm -rf /var/lib/cni/networks/ || true
+  ignore_errors: yes
+
+- name: Create Flannel subnet directory on all nodes
+  file:
+    path: /run/flannel
+    state: directory
+    mode: "0755"
+
+- name: Create Flannel subnet.env on master
+  copy:
+    dest: /run/flannel/subnet.env
+    content: |
+      FLANNEL_NETWORK=10.244.0.0/16
+      FLANNEL_SUBNET=10.244.0.1/24
+      FLANNEL_MTU=1450
+      FLANNEL_IPMASQ=true
+    mode: "0644"
+  delegate_to: "{{ groups['master'][0] }}"
+
+- name: Create Flannel subnet.env on all workers
+  copy:
+    dest: /run/flannel/subnet.env
+    content: |
+      FLANNEL_NETWORK=10.244.0.0/16
+      FLANNEL_SUBNET=10.244.{{ worker_index }}.1/24
+      FLANNEL_MTU=1450
+      FLANNEL_IPMASQ=true
+    mode: "0644"
+  loop: "{{ groups['workers'] }}"
+  loop_control:
+    index_var: worker_index
+    loop_var: worker_name
+  vars:
+    worker_index: "{{ loop.index }}"
+  delegate_to: "{{ worker_name }}"
+
+- name: Restart kubelet on all nodes
+  systemd:
+    name: kubelet
+    state: restarted
+
+- name: Check if Flannel already installed
+  shell: kubectl get daemonset kube-flannel-ds -n kube-flannel 2>/dev/null
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  register: flannel_check
+  failed_when: false
+  changed_when: false
+  run_once: true
+
+- name: Install Flannel CNI
+  shell: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  when: flannel_check.rc != 0
+
+- name: Delete Flannel pods to force restart
+  shell: kubectl delete pod -n kube-flannel -l app=flannel --ignore-not-found
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Wait for Flannel pods to appear
+  shell: kubectl get pods -n kube-flannel -l app=flannel
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  register: flannel_pods
+  until: flannel_pods.rc == 0 and 'flannel' in flannel_pods.stdout
+  retries: 20
+  delay: 15
+  run_once: true
+
+- name: Wait for Flannel pods to be ready
+  shell: kubectl wait --for=condition=Ready pod -l app=flannel -n kube-flannel --timeout=300s
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# ============================================================
+# DISABLE UFW — éviter blocage FORWARD policy DROP
+# ============================================================
+
+- name: Disable UFW on master
+  shell: ufw disable || true
+  ignore_errors: yes
+  become: true
+  delegate_to: "{{ groups['master'][0] }}"
+
+- name: Disable UFW on all workers
+  shell: ufw disable || true
+  loop: "{{ groups['workers'] }}"
+  loop_control:
+    loop_var: worker_name
+  ignore_errors: yes
+  become: true
+  delegate_to: "{{ worker_name }}"
+
+# ============================================================
+# DEBUG FLANNEL — vérifier état avant cni0
+# ============================================================
+
+- name: Debug - Check Flannel pod status
+  shell: kubectl get pods -n kube-flannel -o wide
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  register: flannel_status
+  run_once: true
+  changed_when: false
+
+- name: Debug - Show Flannel pod status
+  debug:
+    msg: "{{ flannel_status.stdout }}"
+  run_once: true
+
+- name: Debug - Check Flannel logs on master
+  shell: |
+    POD=$(kubectl get pod -n kube-flannel -l app=flannel \
+      --field-selector spec.nodeName={{ groups['master'][0] }} \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    kubectl logs -n kube-flannel $POD --tail=30 2>/dev/null || echo "No pod found"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  register: flannel_logs
+  run_once: true
+  changed_when: false
+
+- name: Debug - Show Flannel logs
+  debug:
+    msg: "{{ flannel_logs.stdout }}"
+  run_once: true
+
+# ============================================================
+# FIX TAINT master — s'assurer que Flannel peut scheduler
+# ============================================================
+
+- name: Remove NoSchedule taint on master if present
+  shell: |
+    kubectl taint nodes {{ groups['master'][0] }} \
+      node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+# ============================================================
+# FIX ROUTES CNI0 — attendre ou créer cni0
+# ============================================================
+
+- name: Create cni0 manually on master if missing
+  shell: |
+    if ! ip link show cni0 &>/dev/null; then
+      ip link add cni0 type bridge
+      ip link set cni0 up
+      ip addr add 10.244.0.1/24 dev cni0 2>/dev/null || true
+    fi
+  ignore_errors: yes
+  delegate_to: "{{ groups['master'][0] }}"
+
+- name: Wait for cni0 interface to appear on all workers
+  shell: ip link show cni0
+  loop: "{{ groups['workers'] }}"
+  loop_control:
+    index_var: worker_index
+    loop_var: worker_name
+  register: cni0_check
+  until: cni0_check.rc == 0
+  retries: 20
+  delay: 10
+  ignore_errors: yes
+  delegate_to: "{{ worker_name }}"
+
+- name: Create cni0 manually on all workers if missing
+  shell: |
+    if ! ip link show cni0 &>/dev/null; then
+      ip link add cni0 type bridge
+      ip link set cni0 up
+      ip addr add 10.244.{{ worker_index }}.1/24 dev cni0 2>/dev/null || true
+    fi
+  loop: "{{ groups['workers'] }}"
+  loop_control:
+    index_var: worker_index
+    loop_var: worker_name
+  vars:
+    worker_index: "{{ loop.index }}"
+  ignore_errors: yes
+  delegate_to: "{{ worker_name }}"
+
+# ============================================================
+# FIX VETH ORPHELINES — rattacher les veth orphelines à cni0
+# (Fix du problème NO-CARRIER sur master après recréation cni0)
+# ============================================================
+
+- name: Attach orphan veth interfaces to cni0 on master
+  shell: |
+    for veth in $(ip link show type veth | grep -oP '^[0-9]+: \K[^@]+' | grep veth); do
+      if ! bridge link show | grep -q "$veth"; then
+        ip link set "$veth" master cni0 2>/dev/null && echo "Attached: $veth" || true
+      fi
+    done
+  ignore_errors: yes
+  delegate_to: "{{ groups['master'][0] }}"
+  register: veth_fix_master
+
+- name: Show veth attachment result on master
+  debug:
+    msg: "{{ veth_fix_master.stdout_lines | default([]) }}"
+
+- name: Attach orphan veth interfaces to cni0 on all workers
+  shell: |
+    for veth in $(ip link show type veth | grep -oP '^[0-9]+: \K[^@]+' | grep veth); do
+      if ! bridge link show | grep -q "$veth"; then
+        ip link set "$veth" master cni0 2>/dev/null && echo "Attached: $veth" || true
+      fi
+    done
+  loop: "{{ groups['workers'] }}"
+  loop_control:
+    loop_var: worker_name
+  ignore_errors: yes
+  delegate_to: "{{ worker_name }}"
+  register: veth_fix_workers
+
+- name: Show veth attachment results on all workers
+  debug:
+    msg: "{{ worker_name }}: {{ item.stdout_lines | default([]) }}"
+  loop: "{{ veth_fix_workers.results }}"
+  loop_control:
+    loop_var: item
+    index_var: idx
+  vars:
+    worker_name: "{{ groups['workers'][idx] }}"
+
+# ============================================================
+# VERIFY VETH — vérifier que cni0 est UP après attachement
+# ============================================================
+
+- name: Verify cni0 state on master after veth fix
+  shell: ip link show cni0 | grep -oP 'state \K\w+'
+  delegate_to: "{{ groups['master'][0] }}"
+  register: cni0_state_master
+  changed_when: false
+  ignore_errors: yes
+
+- name: Verify cni0 state on all workers after veth fix
+  shell: ip link show cni0 | grep -oP 'state \K\w+'
+  loop: "{{ groups['workers'] }}"
+  loop_control:
+    loop_var: worker_name
+  register: cni0_state_workers
+  changed_when: false
+  ignore_errors: yes
+  delegate_to: "{{ worker_name }}"
+
+- name: Show cni0 state on all nodes
+  debug:
+    msg: |
+      cni0 master-01 : {{ cni0_state_master.stdout | default('UNKNOWN') }}
+      {% for item in cni0_state_workers.results %}
+      cni0 {{ groups['workers'][loop.index0] }} : {{ item.stdout | default('UNKNOWN') }}
+      {% endfor %}
+
+# ============================================================
+# FIX ROUTES CNI0
+# ============================================================
+
+- name: Fix cni0 route on master
+  shell: |
+    ip route show 10.244.0.0/24 | grep -q cni0 || \
+    ip route add 10.244.0.0/24 dev cni0 proto kernel scope link src 10.244.0.1 2>/dev/null || true
+  ignore_errors: yes
+  delegate_to: "{{ groups['master'][0] }}"
+
+- name: Fix cni0 route on all workers
+  shell: |
+    ip route show 10.244.{{ worker_index }}.0/24 | grep -q cni0 || \
+    ip route add 10.244.{{ worker_index }}.0/24 dev cni0 proto kernel scope link src 10.244.{{ worker_index }}.1 2>/dev/null || true
+  loop: "{{ groups['workers'] }}"
+  loop_control:
+    index_var: worker_index
+    loop_var: worker_name
+  vars:
+    worker_index: "{{ loop.index }}"
+  ignore_errors: yes
+  delegate_to: "{{ worker_name }}"
+
+# ============================================================
+# PERSIST ROUTES CNI0 — survivre au reboot
+# ============================================================
+
+- name: Persist cni0 route on master (survive reboot)
+  copy:
+    dest: /etc/networkd-dispatcher/routable.d/50-flannel-cni0.sh
+    mode: "0755"
+    content: |
+      #!/bin/bash
+      # Recréer cni0 si absent
+      ip link show cni0 &>/dev/null || {
+        ip link add cni0 type bridge
+        ip link set cni0 up
+        ip addr add 10.244.0.1/24 dev cni0 2>/dev/null || true
+      }
+      # Rattacher les veth orphelines
+      for veth in $(ip link show type veth | grep -oP '^[0-9]+: \K[^@]+' | grep veth); do
+        bridge link show | grep -q "$veth" || ip link set "$veth" master cni0 2>/dev/null || true
+      done
+      # Assurer la route
+      ip route add 10.244.0.0/24 dev cni0 proto kernel scope link src 10.244.0.1 2>/dev/null || true
+  delegate_to: "{{ groups['master'][0] }}"
+
+- name: Persist cni0 route on all workers (survive reboot)
+  copy:
+    dest: /etc/networkd-dispatcher/routable.d/50-flannel-cni0.sh
+    mode: "0755"
+    content: |
+      #!/bin/bash
+      # Recréer cni0 si absent
+      ip link show cni0 &>/dev/null || {
+        ip link add cni0 type bridge
+        ip link set cni0 up
+        ip addr add 10.244.{{ worker_index }}.1/24 dev cni0 2>/dev/null || true
+      }
+      # Rattacher les veth orphelines
+      for veth in $(ip link show type veth | grep -oP '^[0-9]+: \K[^@]+' | grep veth); do
+        bridge link show | grep -q "$veth" || ip link set "$veth" master cni0 2>/dev/null || true
+      done
+      # Assurer la route
+      ip route add 10.244.{{ worker_index }}.0/24 dev cni0 proto kernel scope link src 10.244.{{ worker_index }}.1 2>/dev/null || true
+  loop: "{{ groups['workers'] }}"
+  loop_control:
+    index_var: worker_index
+    loop_var: worker_name
+  vars:
+    worker_index: "{{ loop.index }}"
+  delegate_to: "{{ worker_name }}"
+
+# ============================================================
+# NGINX INGRESS — supprimer les Jobs immutables avant apply
+# ============================================================
+
+- name: Delete stale ingress-nginx admission Jobs (immutable, must recreate)
+  shell: |
+    kubectl delete job ingress-nginx-admission-create \
+      -n ingress-nginx --ignore-not-found
+    kubectl delete job ingress-nginx-admission-patch \
+      -n ingress-nginx --ignore-not-found
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Install NGINX Ingress Controller
+  shell: >
+    kubectl apply -f
+    https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/baremetal/deploy.yaml
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# ============================================================
+# VERIFY FINAL — vérification finale routes et connectivité
+# ============================================================
+
+- name: Verify cni0 route on master
+  shell: ip route show 10.244.0.0/24
+  delegate_to: "{{ groups['master'][0] }}"
+  register: route_master
+  changed_when: false
+
+- name: Verify cni0 route on all workers
+  shell: ip route show 10.244.{{ worker_index }}.0/24
+  loop: "{{ groups['workers'] }}"
+  loop_control:
+    index_var: worker_index
+    loop_var: worker_name
+  register: route_workers
+  changed_when: false
+  delegate_to: "{{ worker_name }}"
+
+- name: Show route status
+  debug:
+    msg: |
+      master-01  : {{ route_master.stdout | default('❌ MISSING') }}
+      {% for item in route_workers.results %}
+      {{ groups['workers'][loop.index0] }}  : {{ item.stdout | default('❌ MISSING') }}
+      {% endfor %}
+  run_once: true
+
+- name: Verify bridge veth on master
+  shell: bridge link show | wc -l
+  delegate_to: "{{ groups['master'][0] }}"
+  register: bridge_master
+  changed_when: false
+
+- name: Verify bridge veth on all workers
+  shell: bridge link show | wc -l
+  loop: "{{ groups['workers'] }}"
+  loop_control:
+    loop_var: worker_name
+  register: bridge_workers
+  changed_when: false
+  delegate_to: "{{ worker_name }}"
+
+- name: Show bridge veth count
+  debug:
+    msg: |
+      veth attachées master-01 : {{ bridge_master.stdout | default('0') }}
+      {% for item in bridge_workers.results %}
+      veth attachées {{ groups['workers'][loop.index0] }} : {{ item.stdout | default('0') }}
+      {% endfor %}
+  run_once: true
+

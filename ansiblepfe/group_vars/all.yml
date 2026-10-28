@@ -1,0 +1,98 @@
+---
+kubernetes_version: "1.28.0-1.1"
+kubernetes_semver: "v1.28.0"
+pod_cidr: "10.244.0.0/16"
+service_cidr: "10.96.0.0/12"
+cni_plugin: "flannel"
+container_runtime: "containerd"
+cluster_name: "k8s-cluster"
+internal_cidr: "10.10.0.0/16"
+ingress_nginx_version: "1.8.0"
+tls_secret_name: "example-tls"
+tls_cert_path: ""
+tls_key_path: ""
+ingress_host: "app.example.com"
+ingress_service_name: "my-app-service"
+ingress_service_port: 80
+audit_log_path: "/var/log/kubernetes/audit.log"
+falco_namespace: "falco"
+# UI Falcosidekick : NodePort sur les nœuds ; port-forward équivalent : LOCAL:2802 (LOCAL = ce port)
+falcosidekick_ui_nodeport: 30802
+falco_rules_file: "falco-rules.local.yaml"
+# Falco chart version - auto-détectée par le playbook selon CPU
+# Décommenter pour forcer une version spécifique :
+# falco_helm_chart_version: "4.8.1"   # Falco 0.38.2 - QEMU x86-64-v1
+# falco_helm_chart_version: ""         # latest Falco 0.43.x - requiert x86-64-v2
+kube_bench_config_dir: "/etc/kube-bench/cfg"
+trivy_version: "0.70.0"
+trivy_images:
+  - "nginx:latest"
+  - "flannel/flannel:v0.24.0"
+  - "k8s.gcr.io/kube-apiserver:v1.28.0"
+# Applications avec Autoscaling
+app_namespace: "app-ns"
+app_name: "scaling-app"
+app_image: "nginx:latest"
+app_port: 8080
+app_replicas: 3
+# Resource requests/limits
+app_cpu_request: "100m"
+app_cpu_limit: "500m"
+app_memory_request: "128Mi"
+app_memory_limit: "512Mi"
+# HPA (Horizontal Pod Autoscaler)
+hpa_min_replicas: 2
+hpa_max_replicas: 10
+hpa_cpu_threshold: 70
+hpa_memory_threshold: 80
+#grafana
+monitoring_namespace: monitoring
+loki_service_name: loki
+loki_port: 3100
+promtail_image: grafana/promtail:2.9.0
+promtail_http_port: 9080
+kubernetes_cluster_name: pfe-cloudstack
+
+grafana_admin_password: "SecurePassword123!"
+#email
+smtp_host: "smtp.gmail.com"
+smtp_port: 587
+smtp_user: "moetazbenameur3@gmail.com"
+smtp_password: "hiiq pdyi xozb zxyz"
+smtp_from: "moetazbenameur3@gmail.com"
+email_recipient: "moetazbenameur3@gmail.com"
+project_name: "PFE CloudStack Kubernetes"
+# ===============================
+# Alertes email périodiques
+# ===============================
+cluster_alert_email_enabled: true
+cluster_alert_cron_minute: "*/15"
+cluster_alert_cron_hour: "*"
+cluster_alert_send_only_on_issue: true
+cluster_alert_audit_tail_lines: 40000
+cluster_alert_audit_403_min: 15
+cluster_alert_audit_401_min: 8
+grafana_smtp_enabled: true
+
+# ===============================
+# SECRETS ENCRYPTION & PROTECTION
+# ===============================
+# Kubernetes Secrets encryption at rest configuration
+encryption_enabled: true
+encryption_algorithm: "aescbc"
+
+# Secrets namespace for RBAC and management
+secrets_namespace: "kube-secrets"
+
+# Registry credentials (optional)
+registry_server: "docker.io"
+registry_user: ""
+registry_password: ""
+registry_email: ""
+
+# Enable audit webhooks for secret access logging
+enable_audit_webhooks: false
+audit_webhook_url: "http://localhost:8080/audit"
+
+# Secret rotation threshold (days)
+secret_rotation_threshold_days: 30

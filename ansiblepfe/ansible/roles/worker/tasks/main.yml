@@ -1,0 +1,26 @@
+---
+- name: Fetch join command from master
+  fetch:
+    src: /tmp/join_command.sh
+    dest: /tmp/join_command.sh
+    flat: yes
+  run_once: true
+  delegate_to: "{{ groups['master'][0] }}"
+
+- name: Add master hostname to /etc/hosts on workers
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ hostvars[groups['master'][0]]['ansible_host'] }} master-01"
+    state: present
+    regexp: ".*master-01$"
+
+- name: Copy join command to each worker
+  copy:
+    src: /tmp/join_command.sh
+    dest: /tmp/join_command.sh
+    mode: "0755"
+
+- name: Execute join command
+  command: bash /tmp/join_command.sh
+  register: join_result
+  changed_when: "'This node has joined the cluster' in join_result.stdout"

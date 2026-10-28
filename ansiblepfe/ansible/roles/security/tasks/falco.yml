@@ -1,0 +1,41 @@
+---
+- name: Install helm (if missing)
+  command: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  args:
+    creates: /usr/local/bin/helm
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Add Falco Helm repository
+  command: helm repo add falcosecurity https://falcosecurity.github.io/charts
+  run_once: true
+  delegate_to: "{{ groups['master'][0] }}"
+  ignore_errors: yes
+
+- name: Update Helm repositories
+  command: helm repo update
+  run_once: true
+  delegate_to: "{{ groups['master'][0] }}"
+  ignore_errors: yes
+
+- name: Install Falco
+  command: >
+    helm install falco falcosecurity/falco
+    --namespace {{ falco_namespace }}
+    --create-namespace
+    --set falco.jsonOutput=true
+    --set falco.httpOutput.enabled=true
+    --set falco.httpOutput.url=http://falco-alerts:8080/alerts
+  run_once: true
+  delegate_to: "{{ groups['master'][0] }}"
+  ignore_errors: yes
+
+- name: Render and copy Falco custom rules
+  template:
+    src: falco-rules.local.yaml
+    dest: /etc/falco/falco_rules.local.yaml
+    mode: "0644"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+

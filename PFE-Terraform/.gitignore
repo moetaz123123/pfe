@@ -1,0 +1,50 @@
+# Terraform files
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+tfplan
+tfplan.out
+plan.out
+crash.log
+
+# Sensitive files - NEVER commit
+terraform.tfvars
+!terraform.tfvars.example
+.terraform.tfvars
+*.tfvars.json
+
+# Ansible inventory generated from Terraform
+inventory_hosts.ini
+inventory/hosts.ini
+../ansible/inventory/hosts.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.iml
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Backups
+*.backup
+*.bak
+*.orig
+
+# Temporary
+.cache/
+temp/
+tmp/
+
+

@@ -1,0 +1,27 @@
+---
+# ============================================================
+# KUBERNETES SECRETS ENCRYPTION AND PROTECTION
+# ============================================================
+# Objective: Automate encryption at rest + K8s Secrets management
+# ============================================================
+
+- name: Include encryption at-rest configuration
+  import_tasks: encryption-at-rest.yml
+  tags:
+    - encryption
+    - secrets
+  when: inventory_hostname == groups['master'][0]
+
+- name: Include K8s Secrets management
+  import_tasks: k8s-secrets.yml
+  tags:
+    - secrets
+    - k8s-secrets
+  when: inventory_hostname == groups['master'][0]
+
+- name: Include secrets audit logging
+  import_tasks: audit-secrets.yml
+  tags:
+    - secrets
+    - audit
+  when: inventory_hostname == groups['master'][0]

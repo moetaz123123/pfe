@@ -1,0 +1,210 @@
+---
+# ============================================================
+# KUBEADM CONFIG
+# ============================================================
+- name: Render kubeadm config
+  template:
+    src: kubeadm-config.yml
+    dest: /tmp/kubeadm-config.yml
+    mode: "0644"
+
+# ============================================================
+# IDEMPOTENCE CHECK
+# ============================================================
+- name: Check if cluster is already initialized
+  stat:
+    path: /etc/kubernetes/admin.conf
+  register: kubeadm_already_init
+
+# ============================================================
+# FORCE RESET
+# ============================================================
+- name: Reset cluster if forced
+  command: kubeadm reset -f
+  when:
+    - force_reinit | default(false) | bool
+    - kubeadm_already_init.stat.exists
+
+- name: Clean Kubernetes state if forced
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /var/lib/etcd
+    - /etc/kubernetes/pki
+    - /etc/kubernetes/admin.conf
+    - /etc/kubernetes/kubelet.conf
+    - /etc/kubernetes/controller-manager.conf
+    - /etc/kubernetes/scheduler.conf
+    - /root/.kube/config
+    - /home/ubuntu/.kube/config
+  when:
+    - force_reinit | default(false) | bool
+    - kubeadm_already_init.stat.exists
+
+- name: Re-check initialized state after forced reset
+  stat:
+    path: /etc/kubernetes/admin.conf
+  register: kubeadm_already_init
+
+# ============================================================
+# CLUSTER INITIALIZATION
+# ============================================================
+- name: Initialize Kubernetes cluster
+  command: >
+    kubeadm init
+    --config /tmp/kubeadm-config.yml
+    --upload-certs
+  register: kubeadm_init
+  run_once: true
+  when: not kubeadm_already_init.stat.exists
+  failed_when: >
+    kubeadm_init.rc != 0 and
+    'already exists' not in (kubeadm_init.stderr | default(''))
+
+# ============================================================
+# WAIT FOR API SERVER
+# ============================================================
+- name: Wait for API server to be ready
+  uri:
+    url: "https://127.0.0.1:6443/readyz"
+    validate_certs: no
+    status_code: 200
+  register: api_health
+  until: api_health.status == 200
+  retries: 40
+  delay: 10
+
+# ============================================================
+# KUBECONFIG SETUP
+# ============================================================
+- name: Create .kube directory for root
+  file:
+    path: /root/.kube
+    state: directory
+    mode: "0755"
+
+- name: Copy admin kubeconfig for root
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /root/.kube/config
+    remote_src: yes
+    owner: root
+    mode: "0600"
+
+- name: Create .kube directory for ubuntu user
+  file:
+    path: /home/ubuntu/.kube
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: "0755"
+
+- name: Copy admin kubeconfig for ubuntu user
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /home/ubuntu/.kube/config
+    remote_src: yes
+    owner: ubuntu
+    group: ubuntu
+    mode: "0600"
+
+- name: Ensure KUBECONFIG in ubuntu bashrc
+  lineinfile:
+    path: /home/ubuntu/.bashrc
+    line: 'export KUBECONFIG=/home/ubuntu/.kube/config'
+    regexp: '^export KUBECONFIG='
+    state: present
+
+# ============================================================
+# PATCH ETCD — slow disk tolerance
+# ============================================================
+- name: Patch etcd manifest for slow disk tolerance
+  replace:
+    path: /etc/kubernetes/manifests/etcd.yaml
+    regexp: '(- --snapshot-count=\d+)'
+    replace: '\1\n    - --heartbeat-interval=500\n    - --election-timeout=5000'
+  register: etcd_patch
+
+- name: Wait for etcd to stabilize after patch
+  pause:
+    seconds: 30
+  when: etcd_patch.changed
+
+# ============================================================
+# KUBE-PROXY — patch toleration for control-plane
+# ============================================================
+- name: Check if kube-proxy DaemonSet exists
+  command: kubectl get daemonset kube-proxy -n kube-system
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: kube_proxy_exists
+  failed_when: false
+  changed_when: false
+  run_once: true
+
+- name: Deploy kube-proxy addon
+  command: >
+    kubeadm init phase addon kube-proxy
+    --config /tmp/kubeadm-config.yml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  run_once: true
+  when: kube_proxy_exists.rc != 0
+  retries: 5
+  delay: 15
+  register: kube_proxy_deploy
+  until: kube_proxy_deploy.rc == 0
+
+- name: Patch kube-proxy toleration for control-plane taint
+  command: >
+    kubectl patch daemonset kube-proxy -n kube-system --type=json
+    -p='[{"op":"add","path":"/spec/template/spec/tolerations/-","value":{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}}]'
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  run_once: true
+  register: patch_result
+  changed_when: "'patched' in patch_result.stdout"
+  failed_when:
+    - patch_result.rc != 0
+    - "'already exists' not in patch_result.stderr"
+
+- name: Wait for kube-proxy rollout
+  command: >
+    kubectl rollout status daemonset kube-proxy
+    -n kube-system --timeout=60s
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  run_once: true
+  retries: 3
+  delay: 15
+  register: proxy_rollout
+  until: proxy_rollout.rc == 0
+
+# ============================================================
+# JOIN COMMAND
+# ============================================================
+- name: Wait for API server before generating join command
+  uri:
+    url: "https://127.0.0.1:6443/readyz"
+    validate_certs: no
+    status_code: 200
+  register: api_pre_join
+  until: api_pre_join.status == 200
+  retries: 40
+  delay: 10
+
+- name: Generate join command for workers
+  command: kubeadm token create --print-join-command
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: join_cmd_output
+  changed_when: false
+  run_once: true
+
+- name: Save join command to file
+  copy:
+    content: "{{ join_cmd_output.stdout }}"
+    dest: /tmp/join_command.sh
+    mode: "0755"
+  run_once: true

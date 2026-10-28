@@ -1,0 +1,584 @@
+---
+# ============================================================
+# ENCRYPTION AT REST - ETCD
+# ============================================================
+
+- name: "[ENCRYPTION] Create encryption directory"
+  file:
+    path: /etc/kubernetes/encryption
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  become: true
+  run_once: true
+
+- name: "[ENCRYPTION] Create backup directory"
+  file:
+    path: /etc/kubernetes/encryption/backups
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  become: true
+  run_once: true
+
+- name: "[ENCRYPTION] Check if encryption key exists"
+  stat:
+    path: /etc/kubernetes/encryption/encryption.key
+  become: true
+  register: encryption_key_exists
+  run_once: true
+
+- name: "[ENCRYPTION] Generate encryption key (exactly 32 bytes)"
+  shell: head -c 32 /dev/urandom | base64
+  register: encryption_key_raw
+  when: not encryption_key_exists.stat.exists
+  run_once: true
+  changed_when: true
+  no_log: true
+
+- name: "[ENCRYPTION] Validate generated key length"
+  shell: "echo -n '{{ encryption_key_raw.stdout }}' | base64 -d | wc -c"
+  register: key_length_check
+  when: not encryption_key_exists.stat.exists
+  run_once: true
+  no_log: true
+  failed_when: key_length_check.stdout | int != 32
+
+- name: "[ENCRYPTION] Store encryption key securely"
+  copy:
+    content: "{{ encryption_key_raw.stdout }}"
+    dest: /etc/kubernetes/encryption/encryption.key
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  when: not encryption_key_exists.stat.exists
+  run_once: true
+  no_log: true
+
+- name: "[ENCRYPTION] Read stored encryption key"
+  slurp:
+    src: /etc/kubernetes/encryption/encryption.key
+  become: true
+  register: encryption_key_file
+  run_once: true
+  no_log: true
+
+- name: "[ENCRYPTION] Set encryption key variable"
+  set_fact:
+    encryption_key: "{{ encryption_key_file.content | b64decode | trim }}"
+  run_once: true
+  no_log: true
+
+- name: "[ENCRYPTION] Validate key length before use"
+  shell: "echo -n '{{ encryption_key }}' | base64 -d | wc -c"
+  register: key_validation
+  run_once: true
+  no_log: true
+  failed_when: key_validation.stdout | int != 32
+
+- name: "[ENCRYPTION] Generate encryption config (YAML format)"
+  template:
+    src: encryption-config.yaml.j2
+    dest: /etc/kubernetes/encryption/encryption-config.yaml
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  register: encryption_config
+  run_once: true
+
+- name: "[ENCRYPTION] Verify encryption config YAML is parseable"
+  shell: python3 -c "import yaml; yaml.safe_load(open('/etc/kubernetes/encryption/encryption-config.yaml'))"
+  become: true
+  register: yaml_check
+  run_once: true
+  failed_when: yaml_check.rc != 0
+
+# CORRECTION RACINE : kubelet lit TOUS les fichiers .yaml/.bak dans staticPodPath
+# Les fichiers .bak de kube-apiserver sans le flag causent la recreation du pod sans chiffrement
+- name: "[ENCRYPTION] Purge stale .bak files from manifests dir (critical - kubelet reads all yaml files)"
+  shell: |
+    echo "=== Scanning /etc/kubernetes/manifests/ for stale apiserver bak files ==="
+    for f in /etc/kubernetes/manifests/kube-apiserver.yaml.bak* \
+              /etc/kubernetes/manifests/kube-apiserver.yaml.bak \
+              /etc/kubernetes/manifests/kube-apiserver.yaml.bak2; do
+      [ -f "$f" ] || continue
+      echo "Moving stale file: $f"
+      mv "$f" /etc/kubernetes/encryption/backups/
+    done
+    # Deplacer aussi les .bak des autres composants pour eviter tout conflit
+    for f in /etc/kubernetes/manifests/etcd.yaml.bak* \
+              /etc/kubernetes/manifests/kube-controller-manager.yaml.bak* \
+              /etc/kubernetes/manifests/kube-scheduler.yaml.bak*; do
+      [ -f "$f" ] || continue
+      echo "Moving stale file: $f"
+      mv "$f" /etc/kubernetes/encryption/backups/
+    done
+    echo "=== Remaining files in manifests dir ==="
+    ls -la /etc/kubernetes/manifests/
+    echo "Purge done"
+  become: true
+  changed_when: false
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Purge corrupt backups"
+  shell: |
+    for f in /etc/kubernetes/encryption/backups/kube-apiserver.yaml.*.backup; do
+      [ -f "$f" ] || continue
+      python3 -c "import yaml; yaml.safe_load(open('$f'))" 2>/dev/null || {
+        echo "Removing corrupt backup: $f"
+        rm -f "$f"
+      }
+    done
+    echo "Done"
+  become: true
+  changed_when: false
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Find latest clean backup of kube-apiserver manifest"
+  shell: |
+    if grep -q "encryption-provider-config" /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null; then
+      echo ""
+    else
+      ls -t /etc/kubernetes/encryption/backups/kube-apiserver.yaml.*.backup 2>/dev/null | head -1
+    fi
+  become: true
+  register: latest_backup
+  changed_when: false
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Show latest backup found"
+  debug:
+    msg: "Latest backup: {{ latest_backup.stdout | default('NONE') }}"
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Restore clean manifest from backup"
+  copy:
+    src: "{{ latest_backup.stdout }}"
+    dest: /etc/kubernetes/manifests/kube-apiserver.yaml
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  when:
+    - inventory_hostname == groups['master'][0]
+    - latest_backup.stdout | length > 0
+  register: manifest_restored
+  run_once: true
+
+- name: "[ENCRYPTION] Verify restored manifest is valid YAML"
+  shell: python3 -c "import yaml; yaml.safe_load(open('/etc/kubernetes/manifests/kube-apiserver.yaml')); print('OK')"
+  become: true
+  register: manifest_yaml_check
+  failed_when: manifest_yaml_check.rc != 0
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Backup clean manifest before patching"
+  copy:
+    src: /etc/kubernetes/manifests/kube-apiserver.yaml
+    dest: "/etc/kubernetes/encryption/backups/kube-apiserver.yaml.{{ ansible_date_time.iso8601_basic_short }}.backup"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+# PATCH ATOMIQUE via /tmp + annotation timestamp
+- name: "[ENCRYPTION] Patch manifest - atomic write via /tmp + force kubelet refresh"
+  shell: |
+    MANIFEST=/etc/kubernetes/manifests/kube-apiserver.yaml
+    TMPFILE=$(mktemp /tmp/kube-apiserver-XXXXXX.yaml)
+    FLAG="--encryption-provider-config=/etc/kubernetes/encryption/encryption-config.yaml"
+    MOUNT_NAME="encryption-config"
+    VOLUME_NAME="encryption-config"
+
+    cp "$MANIFEST" "$TMPFILE"
+
+    if grep -q "encryption-provider-config" "$TMPFILE"; then
+      sed -i '/encryption-provider-config/d' "$TMPFILE"
+      echo "Removed existing encryption flag"
+    fi
+
+    sed -i "/--allow-privileged=true/a\\    - $FLAG" "$TMPFILE"
+    echo "Inserted flag after --allow-privileged"
+
+    if ! grep -q "name: $MOUNT_NAME" "$TMPFILE"; then
+      sed -i "/^    image: registry.k8s.io\/kube-apiserver/i\\    - mountPath: /etc/kubernetes/encryption\n      name: $MOUNT_NAME\n      readOnly: true" "$TMPFILE"
+      echo "Added volumeMount"
+    else
+      echo "volumeMount already present"
+    fi
+
+    if ! grep -q "name: $VOLUME_NAME" "$TMPFILE"; then
+      echo "  - hostPath:" >> "$TMPFILE"
+      echo "      path: /etc/kubernetes/encryption" >> "$TMPFILE"
+      echo "      type: DirectoryOrCreate" >> "$TMPFILE"
+      echo "    name: $VOLUME_NAME" >> "$TMPFILE"
+      echo "Added hostPath volume"
+    else
+      echo "volume already present"
+    fi
+
+    TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if grep -q "annotations:" "$TMPFILE"; then
+      if grep -q "encryption-refresh" "$TMPFILE"; then
+        sed -i "s|encryption-refresh:.*|encryption-refresh: \"$TIMESTAMP\"|" "$TMPFILE"
+      else
+        sed -i "/^  annotations:/a\\    encryption-refresh: \"$TIMESTAMP\"" "$TMPFILE"
+      fi
+    else
+      sed -i "/^metadata:/a\\  annotations:\n    encryption-refresh: \"$TIMESTAMP\"" "$TMPFILE"
+    fi
+    echo "Annotation timestamp: $TIMESTAMP"
+
+    python3 -c "import yaml; yaml.safe_load(open('$TMPFILE')); print('YAML_OK')"
+    if [ $? -ne 0 ]; then
+      rm -f "$TMPFILE"
+      echo "ERROR: YAML validation failed"
+      exit 1
+    fi
+
+    COUNT=$(grep -c "encryption-provider-config" "$TMPFILE")
+    echo "Flag count in file: $COUNT"
+    if [ "$COUNT" -ne 1 ]; then
+      rm -f "$TMPFILE"
+      echo "ERROR: unexpected flag count $COUNT"
+      exit 1
+    fi
+
+    mv "$TMPFILE" "$MANIFEST"
+    chmod 0600 "$MANIFEST"
+    chown root:root "$MANIFEST"
+    echo "PATCHED_OK"
+  become: true
+  register: patch_result
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+  changed_when: "'PATCHED_OK' in patch_result.stdout"
+  failed_when: patch_result.rc != 0
+
+- name: "[ENCRYPTION] Show patch result"
+  debug:
+    var: patch_result.stdout_lines
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Verify manifest on disk"
+  shell: |
+    MANIFEST=/etc/kubernetes/manifests/kube-apiserver.yaml
+    python3 -c "
+    import yaml
+    doc = yaml.safe_load(open('$MANIFEST'))
+    for c in doc['spec']['containers']:
+        if c['name'] == 'kube-apiserver':
+            cmds = c['command']
+            enc = [cmd for cmd in cmds if 'encryption' in cmd]
+            print(f'Total args: {len(cmds)}')
+            print(f'Encrypt flags: {enc}')
+            idx = next((i for i,cmd in enumerate(cmds) if 'encryption' in cmd), None)
+            print(f'Flag position: {idx}')
+    "
+  become: true
+  register: manifest_check
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Show manifest verification"
+  debug:
+    var: manifest_check.stdout_lines
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Check running container has encryption flag"
+  shell: |
+    CID=$(crictl ps --name kube-apiserver -q 2>/dev/null | head -1)
+    if [ -z "$CID" ]; then
+      echo "NO_CONTAINER"
+      exit 0
+    fi
+    COUNT=$(crictl inspect "$CID" 2>/dev/null | \
+      jq -r '.info.runtimeSpec.process.args[]' 2>/dev/null | \
+      grep -c "encryption-provider-config" || true)
+    if [ "${COUNT:-0}" -gt 0 ]; then
+      echo "OK"
+    else
+      echo "NEEDS_RESTART"
+    fi
+  become: true
+  register: container_args_check
+  changed_when: false
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Show container check result"
+  debug:
+    msg: "Container encryption check : {{ container_args_check.stdout }}"
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Force clean apiserver recreation"
+  block:
+    - name: "Stop kubelet"
+      systemd:
+        name: kubelet
+        state: stopped
+      become: true
+
+    - name: "Move manifest out of manifests dir to prevent kubelet reload"
+      shell: |
+        mv /etc/kubernetes/manifests/kube-apiserver.yaml /tmp/kube-apiserver-reload.yaml
+        echo "Manifest moved to /tmp"
+      become: true
+
+    - name: "Remove all apiserver containers from CRI"
+      shell: |
+        for CID in $(crictl ps -a --name kube-apiserver -q 2>/dev/null); do
+          crictl rm -f "$CID" 2>/dev/null || true
+          echo "Removed container $CID"
+        done
+        echo "Containers done"
+      become: true
+      register: cri_cleanup
+
+    - name: "Debug CRI cleanup"
+      debug:
+        var: cri_cleanup.stdout_lines
+
+    # CLE DU SUCCES : supprimer le pod sandbox containerd
+    - name: "Remove apiserver pod sandbox from containerd (critical step)"
+      shell: |
+        for POD in $(crictl pods --name kube-apiserver -q 2>/dev/null); do
+          crictl rmp -f "$POD" 2>/dev/null || true
+          echo "Removed sandbox $POD"
+        done
+        echo "=== Verification - doit etre vide ==="
+        crictl pods --name kube-apiserver 2>/dev/null || true
+        echo "Sandboxes done"
+      become: true
+      register: sandbox_cleanup
+
+    - name: "Debug sandbox cleanup"
+      debug:
+        var: sandbox_cleanup.stdout_lines
+
+    - name: "Delete stale pod mirror from etcd"
+      shell: |
+        ETCDCTL_API=3 etcdctl \
+          --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+          --cert=/etc/kubernetes/pki/apiserver-etcd-client.crt \
+          --key=/etc/kubernetes/pki/apiserver-etcd-client.key \
+          del /registry/pods/kube-system/kube-apiserver-master-01 || true
+        echo "etcd mirror deleted"
+      become: true
+      register: etcd_delete
+
+    - name: "Debug etcd delete"
+      debug:
+        var: etcd_delete.stdout_lines
+
+    - name: "Purge kubelet pod cache dirs"
+      shell: |
+        find /var/lib/kubelet/pods -name "etc-hosts" 2>/dev/null | \
+          xargs grep -l "kube-apiserver" 2>/dev/null | \
+          sed 's|/etc-hosts||' | xargs -r rm -rf
+        rm -f /var/lib/kubelet/config/cache/* 2>/dev/null || true
+        rm -rf /var/lib/kubelet/checkpoint/* 2>/dev/null || true
+        echo "Kubelet cache purged"
+      become: true
+
+    - name: "Start kubelet WITHOUT manifest"
+      systemd:
+        name: kubelet
+        state: started
+      become: true
+
+    # Attendre que le sandbox soit absent avant de remettre le manifest
+    - name: "Wait until NO apiserver sandbox exists (max 60s)"
+      shell: |
+        COUNT=$(crictl pods --name kube-apiserver -q 2>/dev/null | wc -l)
+        echo "${COUNT}"
+      become: true
+      register: sandbox_gone
+      until: sandbox_gone.stdout | int == 0
+      retries: 12
+      delay: 5
+
+    - name: "Restore manifest to trigger fresh pod creation"
+      shell: |
+        mv /tmp/kube-apiserver-reload.yaml /etc/kubernetes/manifests/kube-apiserver.yaml
+        echo "Manifest restored at $(date)"
+      become: true
+
+    # Attendre un container qui tourne ET qui a le flag
+    - name: "Wait for new container WITH encryption flag (max 180s)"
+      shell: |
+        CID=$(crictl ps --name kube-apiserver -q 2>/dev/null | head -1)
+        [ -z "$CID" ] && echo "0" && exit 0
+        COUNT=$(crictl inspect "$CID" 2>/dev/null | \
+          jq -r '.info.runtimeSpec.process.args[]' 2>/dev/null | \
+          grep -c "encryption-provider-config" || true)
+        echo "${COUNT:-0}"
+      become: true
+      register: pod_appeared
+      until: pod_appeared.stdout | int > 0
+      retries: 36
+      delay: 5
+
+    - name: "Wait 10s for container to fully initialize"
+      pause:
+        seconds: 10
+
+    - name: "Verify new container has encryption flag"
+      shell: |
+        CID=$(crictl ps --name kube-apiserver -q 2>/dev/null | head -1)
+        if [ -z "$CID" ]; then
+          echo "ERROR: no kube-apiserver container found"
+          exit 1
+        fi
+        RAW=$(crictl inspect "$CID" 2>/dev/null)
+        TOTAL=$(echo "$RAW" | jq '.info.runtimeSpec.process.args | length' 2>/dev/null)
+        COUNT=$(echo "$RAW" | jq -r '.info.runtimeSpec.process.args[]' 2>/dev/null | \
+          grep -c "encryption-provider-config" || true)
+        echo "Total args in container: $TOTAL"
+        echo "Encrypt flag count: $COUNT"
+        if [ "${COUNT:-0}" -gt 0 ]; then
+          echo "FLAG_PRESENT"
+        else
+          echo "FLAG_ABSENT"
+          echo "--- All args ---"
+          echo "$RAW" | jq -r '.info.runtimeSpec.process.args[]' 2>/dev/null
+          exit 1
+        fi
+      become: true
+      register: new_container_check
+      failed_when: new_container_check.rc != 0
+
+    - name: "Debug new container check"
+      debug:
+        var: new_container_check.stdout_lines
+
+    - name: "Show encryption startup logs"
+      shell: |
+        CID=$(crictl ps --name kube-apiserver -q 2>/dev/null | head -1)
+        crictl logs "$CID" 2>&1 | grep -i "encrypt" | head -10
+      become: true
+      register: encryption_logs
+      ignore_errors: true
+
+    - name: "Debug encryption startup logs"
+      debug:
+        var: encryption_logs.stdout_lines
+
+  when:
+    - inventory_hostname == groups['master'][0]
+    - patch_result.changed or container_args_check.stdout in ['NEEDS_RESTART', 'NO_CONTAINER']
+  run_once: true
+
+- name: "[ENCRYPTION] Wait for API server readiness"
+  uri:
+    url: "https://127.0.0.1:6443/readyz"
+    validate_certs: no
+    status_code: 200
+  register: api_ready_after_patch
+  until: api_ready_after_patch.status == 200
+  retries: 30
+  delay: 5
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Re-encrypt all existing secrets"
+  shell: |
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf get secrets -A -o json | \
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf replace -f -
+  become: true
+  when:
+    - inventory_hostname == groups['master'][0]
+    - patch_result.changed or container_args_check.stdout in ['NEEDS_RESTART', 'NO_CONTAINER']
+  run_once: true
+
+- name: "[ENCRYPTION] Create validation test secret"
+  shell: |
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+      delete secret encryption-validation-test --namespace=default --ignore-not-found
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+      create secret generic encryption-validation-test \
+      --from-literal=check=encrypted_$(date +%s) \
+      --namespace=default
+  become: true
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Verify test secret is encrypted in etcd"
+  shell: |
+    ETCDCTL_API=3 etcdctl \
+      --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+      --cert=/etc/kubernetes/pki/apiserver-etcd-client.crt \
+      --key=/etc/kubernetes/pki/apiserver-etcd-client.key \
+      get /registry/secrets/default/encryption-validation-test | \
+      grep -ac "k8s:enc:aescbc"
+  become: true
+  register: etcd_check
+  failed_when: etcd_check.stdout | int == 0
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Confirm no plaintext value visible in etcd"
+  shell: |
+    ETCDCTL_API=3 etcdctl \
+      --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+      --cert=/etc/kubernetes/pki/apiserver-etcd-client.crt \
+      --key=/etc/kubernetes/pki/apiserver-etcd-client.key \
+      get /registry/secrets/default/encryption-validation-test | \
+      strings | grep -c "encrypted_" || true
+  become: true
+  register: plaintext_check
+  failed_when: plaintext_check.stdout | int > 0
+  when: inventory_hostname == groups['master'][0]
+  run_once: true
+
+- name: "[ENCRYPTION] Backup encryption key"
+  copy:
+    src: /etc/kubernetes/encryption/encryption.key
+    dest: "/etc/kubernetes/encryption/backups/encryption.key.{{ ansible_date_time.iso8601_basic_short }}.backup"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  run_once: true
+
+- name: "[ENCRYPTION] Log encryption setup"
+  lineinfile:
+    path: /var/log/kubernetes/encryption-setup.log
+    line: "[{{ ansible_date_time.iso8601 }}] Encryption at rest (aescbc/YAML) configured for cluster {{ cluster_name }}"
+    create: yes
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  run_once: true
+
+- name: "[ENCRYPTION] Print summary"
+  debug:
+    msg: |
+      ============================================================
+      ENCRYPTION AT REST - ACTIVE
+      ============================================================
+      Config   : /etc/kubernetes/encryption/encryption-config.yaml
+      Format   : YAML (natif Kubernetes)
+      Algorithm: AES-CBC (aescbc)
+      etcd check (enc)  : {{ etcd_check.stdout }}/1
+      etcd check (clair): {{ plaintext_check.stdout }}/0
+      ============================================================
+  run_once: true

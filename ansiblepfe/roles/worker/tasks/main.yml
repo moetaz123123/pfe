@@ -1,0 +1,53 @@
+---
+- name: Fetch join command from master
+  fetch:
+    src: /tmp/join_command.sh
+    dest: /tmp/join_command.sh
+    flat: yes
+  run_once: true
+  delegate_to: "{{ groups['master'][0] }}"
+
+- name: Add master hostname to /etc/hosts on workers
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ hostvars[groups['master'][0]]['ansible_host'] }} master-01"
+    state: present
+    regexp: ".*master-01$"
+
+- name: Reset worker if forced
+  command: kubeadm reset -f
+  when: force_reinit | default(false) | bool
+
+- name: Remove leftover kubelet config if forced
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/kubernetes/kubelet.conf
+    - /etc/kubernetes/pki
+  when: force_reinit | default(false) | bool
+
+- name: Add route to Kubernetes service CIDR
+  command: ip route add 10.96.0.0/12 via {{ hostvars[groups['master'][0]]['ansible_host'] }}
+  register: route_result
+  failed_when:
+    - route_result.rc != 0
+    - "'File exists' not in route_result.stderr"
+  changed_when: route_result.rc == 0
+
+- name: Copy join command to each worker
+  copy:
+    src: /tmp/join_command.sh
+    dest: /tmp/join_command.sh
+    mode: "0755"
+
+- name: Check if worker already joined
+  stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: worker_already_joined
+
+- name: Execute join command
+  command: bash /tmp/join_command.sh
+  register: join_result
+  when: not worker_already_joined.stat.exists
+  changed_when: "'This node has joined the cluster' in join_result.stdout"

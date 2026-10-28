@@ -1,0 +1,16 @@
+---
+- name: Render RBAC config to master
+  template:
+    src: rbac-config.yaml
+    dest: /tmp/rbac-config.yaml
+    mode: "0644"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+- name: Apply RBAC configuration
+  command: kubectl apply -f /tmp/rbac-config.yaml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+

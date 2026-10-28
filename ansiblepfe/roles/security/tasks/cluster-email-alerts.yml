@@ -1,0 +1,29 @@
+---
+# Alertes email périodiques : pods dégradés, nœuds, audit 401/403
+# Réutilise msmtp/mutt installés par send-deployment-email.yml
+# et les variables smtp_*/email_*.
+
+- name: Install cluster health alert script on master
+  template:
+    src: cluster-health-alerts.sh.j2
+    dest: /usr/local/bin/cluster-health-alerts.sh
+    mode: "0755"
+  when: cluster_alert_email_enabled | default(true) | bool
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true
+
+# Planification toutes les 15 minutes (*/15)
+- name: Schedule cluster health alerts (cron every 15 min)
+  cron:
+    name: "Kubernetes cluster email alerts"
+    minute: "*/15"
+    hour: "*"
+    day: "*"
+    month: "*"
+    weekday: "*"
+    user: root
+    job: "/usr/local/bin/cluster-health-alerts.sh >> /var/log/cluster-health-alerts.log 2>&1"
+    state: present
+  when: cluster_alert_email_enabled | default(true) | bool
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: true

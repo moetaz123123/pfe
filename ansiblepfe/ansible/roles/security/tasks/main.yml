@@ -1,0 +1,11 @@
+---
+- import_tasks: node-hardening.yml
+- import_tasks: rbac.yml
+- import_tasks: network-policies.yml
+- import_tasks: ingress-tls.yml
+- import_tasks: audit-logging.yml
+- import_tasks: falco.yml
+- import_tasks: kube-bench.yml
+- import_tasks: kube-hunter.yml
+- import_tasks: trivy.yml
+

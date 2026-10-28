@@ -1,0 +1,354 @@
+---
+# ============================================================================
+# GRAFANA DASHBOARD - Kubernetes Audit Log Visualization
+# CORRECTIONS :
+#   - Suppression panneaux CPU, Mémoire, Stockage (Prometheus) — id 1, 2, 3
+#   - Suppression variable datasource_prometheus du templating
+#   - Les 4 stats Loki (Total, 403, Secrets, Suppressions) à y=0
+#   - Tous les gridPos.y décalés en conséquence
+#   - Guillemets internes corrigés (namespace=~".+" et job="kubernetes-audit")
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: audit-dashboard
+  namespace: {{ monitoring_namespace | default('monitoring') }}
+  labels:
+    grafana_dashboard: "1"
+    app: promtail-audit
+data:
+  audit-dashboard.json: |
+    {
+      "dashboard": {
+        "title": "Kubernetes Audit Log Dashboard",
+        "description": "Surveillance complète de l'audit log Kubernetes avec Loki",
+        "tags": ["kubernetes", "audit", "security", "loki"],
+        "timezone": "browser",
+        "uid": "k8s-audit-logs",
+        "refresh": "30s",
+        "time": {
+          "from": "now-6h",
+          "to": "now"
+        },
+        "templating": {
+          "list": [
+            {
+              "name": "datasource_loki",
+              "type": "datasource",
+              "pluginId": "loki",
+              "current": {
+                "value": "Loki",
+                "text": "Loki"
+              }
+            },
+            {
+              "name": "cluster",
+              "type": "query",
+              "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+              "query": "label_values({namespace!=\"\"}, cluster)",
+              "current": { "value": "", "text": "All" },
+              "includeAll": true,
+              "allValue": ".*"
+            },
+            {
+              "name": "namespace",
+              "type": "query",
+              "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+              "query": "label_values({job=\"kubernetes-audit\", namespace!=\"\"}, namespace)",
+              "current": { "value": "$__all", "text": "All" },
+              "includeAll": true,
+              "allValue": "(falco|defectdojo|monitoring|kube-system|kube-apiserver|ingress-nginx|vault)"
+            }
+          ]
+        },
+        "panels": [
+
+          {
+            "id": 4,
+            "title": "📊 Total Requêtes (1h)",
+            "type": "stat",
+            "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "count_over_time({job=\"kubernetes-audit\", namespace!=\"\", namespace=~\"$namespace\"}[1h])",
+                "refId": "A",
+                "legendFormat": "Total"
+              }
+            ],
+            "options": {
+              "orientation": "auto",
+              "textMode": "auto",
+              "colorMode": "value",
+              "graphMode": "area",
+              "justifyMode": "auto"
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": { "mode": "fixed", "fixedColor": "green" },
+                "noValue": "0"
+              }
+            }
+          },
+
+          {
+            "id": 6,
+            "title": "🚫 Requêtes Refusées (403)",
+            "type": "stat",
+            "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "count_over_time({job=\"kubernetes-audit\", namespace!=\"\", namespace=~\"$namespace\", statusCode=\"403\"}[1h])",
+                "refId": "A"
+              }
+            ],
+            "options": {
+              "colorMode": "value",
+              "graphMode": "area"
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": { "mode": "fixed", "fixedColor": "red" },
+                "noValue": "0"
+              }
+            }
+          },
+
+          {
+            "id": 7,
+            "title": "🔑 Accès Secrets",
+            "type": "stat",
+            "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "count_over_time({job=\"kubernetes-audit\", namespace!=\"\", namespace=~\"$namespace\", resource=\"secrets\"}[1h])",
+                "refId": "A"
+              }
+            ],
+            "options": {
+              "colorMode": "value",
+              "graphMode": "area"
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": { "mode": "fixed", "fixedColor": "orange" },
+                "noValue": "0"
+              }
+            }
+          },
+
+          {
+            "id": 8,
+            "title": "🗑️ Suppressions",
+            "type": "stat",
+            "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "count_over_time({job=\"kubernetes-audit\", namespace!=\"\", namespace=~\"$namespace\", verb=\"delete\"}[1h])",
+                "refId": "A"
+              }
+            ],
+            "options": {
+              "colorMode": "value",
+              "graphMode": "area"
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": { "mode": "fixed", "fixedColor": "purple" },
+                "noValue": "0"
+              }
+            }
+          },
+
+          {
+            "id": 5,
+            "title": "📈 Requêtes par Code HTTP (trend)",
+            "type": "timeseries",
+            "gridPos": {"x": 0, "y": 4, "w": 12, "h": 6},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "sum by (statusCode) (rate({job=\"kubernetes-audit\", namespace!=\"\", namespace=~\"$namespace\"}[5m]))",
+                "legendFormat": "HTTP {{statusCode}}"
+              }
+            ],
+            "options": {
+              "legend": {
+                "calcs": [],
+                "displayMode": "list",
+                "placement": "bottom"
+              }
+            }
+          },
+
+          {
+            "id": 9,
+            "title": "👥 Top 10 Utilisateurs",
+            "type": "barchart",
+            "gridPos": {"x": 12, "y": 4, "w": 12, "h": 6},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "topk(10, sum by (username) (count_over_time({job=\"kubernetes-audit\", namespace!=\"\", namespace=~\"$namespace\"}[1h])))",
+                "legendFormat": "{{username}}"
+              }
+            ]
+          },
+
+          {
+            "id": 10,
+            "title": "🍩 Logs par Namespace",
+            "type": "piechart",
+            "gridPos": {"x": 0, "y": 10, "w": 12, "h": 8},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "sum by (namespace) (count_over_time({job=\"kubernetes-audit\", namespace=~\".+\"}[1h]))",
+                "legendFormat": "{{namespace}}"
+              }
+            ],
+            "options": {
+              "pieType": "donut",
+              "legend": {
+                "displayMode": "table",
+                "placement": "right",
+                "values": ["percent", "value"]
+              }
+            }
+          },
+
+          {
+            "id": 11,
+            "title": "📊 Distribution des Verbes (GET/POST/DELETE...)",
+            "type": "piechart",
+            "gridPos": {"x": 12, "y": 10, "w": 12, "h": 8},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "sum by (verb) (count_over_time({job=\"kubernetes-audit\", namespace!=\"\", namespace=~\"$namespace\"}[1h]))",
+                "legendFormat": "{{verb}}"
+              }
+            ],
+            "options": {
+              "pieType": "donut",
+              "legend": {
+                "displayMode": "table",
+                "placement": "right",
+                "values": ["percent", "value"]
+              }
+            }
+          },
+
+          {
+            "id": 12,
+            "title": "🚫 Logs Refusés en Direct (403)",
+            "type": "logs",
+            "gridPos": {"x": 0, "y": 18, "w": 24, "h": 6},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "{job=\"kubernetes-audit\", namespace!=\"\", namespace=~\"$namespace\", statusCode=\"403\"}",
+                "refId": "A"
+              }
+            ]
+          },
+
+          {
+            "id": 13,
+            "title": "🔑 Accès aux Secrets",
+            "type": "logs",
+            "gridPos": {"x": 0, "y": 24, "w": 24, "h": 6},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "{job=\"kubernetes-audit\", namespace!=\"\", namespace=~\"$namespace\", resource=\"secrets\"}",
+                "refId": "A"
+              }
+            ]
+          },
+
+          {
+            "id": 14,
+            "title": "🗑️ Événements de Suppression",
+            "type": "logs",
+            "gridPos": {"x": 0, "y": 30, "w": 24, "h": 6},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "{job=\"kubernetes-audit\", namespace!=\"\", namespace=~\"$namespace\", verb=\"delete\"}",
+                "refId": "A"
+              }
+            ]
+          },
+
+          {
+            "id": 15,
+            "title": "🔌 Accès aux Pod Exec / Attach / Port-forward",
+            "type": "logs",
+            "gridPos": {"x": 0, "y": 36, "w": 24, "h": 6},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "{job=\"kubernetes-audit\", namespace!=\"\", namespace=~\"$namespace\", resource=~\"pods/(exec|attach|portforward)\"}",
+                "refId": "A"
+              }
+            ]
+          },
+
+          {
+            "id": 16,
+            "title": "📊 Ressources les Plus Accédées",
+            "type": "barchart",
+            "gridPos": {"x": 0, "y": 42, "w": 12, "h": 6},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "topk(10, sum by (resource) (count_over_time({job=\"kubernetes-audit\", namespace!=\"\", namespace=~\"$namespace\"}[1h])))",
+                "legendFormat": "{{resource}}"
+              }
+            ]
+          },
+
+          {
+            "id": 17,
+            "title": "🏢 Namespaces les Plus Actifs",
+            "type": "barchart",
+            "gridPos": {"x": 12, "y": 42, "w": 12, "h": 6},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "topk(10, sum by (namespace) (count_over_time({job=\"kubernetes-audit\", namespace=~\".+\"}[1h])))",
+                "legendFormat": "{{namespace}}"
+              }
+            ]
+          },
+
+          {
+            "id": 18,
+            "title": "🔎 Live Cluster Logs — Namespaces applicatifs uniquement",
+            "type": "logs",
+            "gridPos": {"x": 0, "y": 48, "w": 24, "h": 8},
+            "datasource": { "type": "loki", "uid": "${datasource_loki}" },
+            "targets": [
+              {
+                "expr": "{job=\"kubernetes-audit\", namespace!=\"\", namespace=~\"$namespace\"}",
+                "refId": "A"
+              }
+            ],
+            "options": {
+              "dedupStrategy": "none",
+              "showLabels": true,
+              "showTime": true,
+              "wrapLogMessage": true,
+              "sortOrder": "Descending"
+            }
+          }
+
+        ],
+        "schemaVersion": 36,
+        "style": "dark"
+      }
+    }

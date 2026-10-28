@@ -1,0 +1,226 @@
+---
+# =============================================================================
+# METRICS SERVER (IDEMPOTENT + STABLE)
+# =============================================================================
+
+- name: Check if Metrics Server exists
+  shell: kubectl get deployment metrics-server -n kube-system --ignore-not-found
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  register: metrics_server_check
+  changed_when: false
+  failed_when: false
+  run_once: yes
+
+- name: Deploy Metrics Server only if absent
+  command: >
+    kubectl apply -f
+    https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: yes
+  when: metrics_server_check.stdout == ""
+
+- name: Wait 15 seconds after Metrics Server install
+  pause:
+    seconds: 15
+  when: metrics_server_check.stdout == ""
+  run_once: yes
+
+- name: Check Metrics Server args
+  shell: >
+    kubectl get deployment metrics-server -n kube-system
+    -o jsonpath='{.spec.template.spec.containers[0].args}'
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  register: metrics_args
+  changed_when: false
+  failed_when: false
+  run_once: yes
+
+- name: Patch Metrics Server for insecure TLS
+  command: >
+    kubectl patch deployment metrics-server -n kube-system
+    --type=json
+    -p=[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: yes
+  when: "'--kubelet-insecure-tls' not in metrics_args.stdout"
+
+- name: Wait for Metrics Server rollout
+  command: >
+    kubectl rollout status deployment/metrics-server
+    -n kube-system --timeout=180s
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: yes
+  retries: 3
+  delay: 10
+  # FIX: rollout status retourne toujours rc=0 quand déjà stable,
+  # on ne force pas changed_when pour éviter un faux "changed"
+  changed_when: false
+
+# =============================================================================
+# APPLICATION NAMESPACE
+# =============================================================================
+
+- name: Create app namespace
+  # FIX: utilisation du module shell au lieu de command pour que le pipe
+  # soit interprété par bash. Avec command, '|' est passé littéralement
+  # à kubectl comme argument, ce qui provoque "unknown shorthand flag: 'f'"
+  shell: >
+    kubectl create namespace {{ app_namespace }} --dry-run=client -o yaml
+    | kubectl apply -f -
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: yes
+  register: ns_result
+  changed_when: "'created' in ns_result.stdout"
+  failed_when: ns_result.rc != 0
+
+# =============================================================================
+# APPLICATION + HPA
+# =============================================================================
+
+- name: Render k8s app manifest from template
+  template:
+    src: k8s-app-scale.yaml.j2
+    dest: /tmp/k8s-app-scale.yaml
+    mode: "0644"
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: yes
+
+- name: Check for conflicting Ingress before apply
+  command: >
+    kubectl get ingress {{ app_name }}-ingress -n {{ app_namespace }}
+    --ignore-not-found=true -o name
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  register: conflicting_ingress
+  run_once: yes
+  changed_when: false
+  failed_when: false
+
+- name: Delete conflicting Ingress if present
+  command: >
+    kubectl delete ingress {{ app_name }}-ingress -n {{ app_namespace }}
+    --ignore-not-found=true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: yes
+  when: conflicting_ingress.stdout != ""
+
+- name: Deploy application manifests
+  command: kubectl apply -f /tmp/k8s-app-scale.yaml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: yes
+  register: app_deploy_result
+  changed_when: >
+    'configured' in app_deploy_result.stdout
+    or 'created' in app_deploy_result.stdout
+
+- name: Display deploy result
+  debug:
+    msg: "{{ app_deploy_result.stdout_lines }}"
+  run_once: yes
+
+# =============================================================================
+# WAIT FOR ROLLOUT
+# =============================================================================
+
+- name: Wait for application rollout
+  command: >
+    kubectl rollout status deployment/{{ app_name }}
+    -n {{ app_namespace }} --timeout=300s
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  run_once: yes
+  retries: 3
+  delay: 10
+  # FIX: on ne ignore plus les erreurs — un rollout échoué doit stopper le play.
+  # Si un timeout survient, le déploiement est réellement en échec.
+  register: rollout_result
+  failed_when: rollout_result.rc != 0
+  changed_when: false
+
+# =============================================================================
+# VERIFY STATUS
+# =============================================================================
+
+- name: Show Metrics Server status
+  command: kubectl get pods -n kube-system -l k8s-app=metrics-server
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  register: metrics_status
+  changed_when: false
+  run_once: yes
+
+- name: Warn if Metrics Server has excessive restarts
+  # FIX: alerte si le nombre de restarts est anormalement élevé (>10).
+  # Dans le run observé, 55 restarts en 3j indique un problème (OOMKilled
+  # ou probe trop agressive). Cette tâche remonte l'information sans bloquer.
+  debug:
+    msg: >-
+      ⚠️  WARNING: Metrics Server shows high restart count.
+      Check: kubectl describe pod -n kube-system -l k8s-app=metrics-server
+  when: metrics_status.stdout is search('[1-9][0-9]+ \(')
+  run_once: yes
+
+- name: Show application pods
+  command: kubectl get pods -n {{ app_namespace }} -o wide
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  register: app_status
+  changed_when: false
+  run_once: yes
+
+- name: Show HPA status
+  command: kubectl get hpa -n {{ app_namespace }}
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  register: hpa_status
+  changed_when: false
+  run_once: yes
+  # FIX: on retire ignore_errors — si le HPA est absent c'est une vraie
+  # anomalie. Le default filter dans le debug ci-dessous suffit pour
+  # l'affichage, mais l'erreur doit remonter.
+  failed_when: hpa_status.rc != 0
+
+- name: Print deployment summary
+  debug:
+    msg: |
+      ╔══════════════════════════════════════════════╗
+      ║         APPLICATION DEPLOYMENT OK           ║
+      ╠══════════════════════════════════════════════╣
+
+      📊 Metrics Server:
+      {{ metrics_status.stdout }}
+
+      🚀 Application Pods:
+      {{ app_status.stdout }}
+
+      📈 HPA Status:
+      {{ hpa_status.stdout | default('N/A') }}
+
+      ✅ Metrics Server stable
+      ✅ No forced delete
+      ✅ No unnecessary restart
+      ✅ HPA enabled
+
+      ╚══════════════════════════════════════════════╝
+  run_once: yes

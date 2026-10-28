@@ -1,0 +1,40 @@
+---
+kubernetes_version: "1.28.0-1.1"
+kubernetes_semver: "v1.28.0"
+
+pod_cidr: "10.244.0.0/16"
+service_cidr: "10.96.0.0/12"
+
+cni_plugin: "calico" # options: calico, cilium
+container_runtime: "containerd"
+
+cluster_name: "k8s-cluster"
+
+# Sécurité OS / accès
+internal_cidr: "192.168.0.0/16"
+
+# Ingress TLS
+ingress_nginx_version: "1.8.0"
+tls_secret_name: "example-tls"
+tls_cert_path: "" # à remplacer
+tls_key_path: ""   # à remplacer
+ingress_host: "app.example.com"
+ingress_service_name: "my-app-service"
+ingress_service_port: 80
+
+# Audit logging
+audit_log_path: "/var/log/kubernetes/audit.log"
+
+# Falco
+falco_namespace: "falco"
+falco_rules_file: "falco-rules.local.yaml"
+
+# Scans vulnérabilités
+kube_bench_config_dir: "/etc/kube-bench/cfg"
+trivy_version: "0.42.0"
+
+trivy_images:
+  - "nginx:latest"
+  - "calico/node:v3.26"
+  - "k8s.gcr.io/kube-apiserver:v1.28.0"
+
